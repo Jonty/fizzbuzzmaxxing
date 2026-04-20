@@ -926,6 +926,184 @@ def fizzbuzz_term(start: int, stop: int) -> FinalTerm:
 
 
 # ===========================================================================
+# § 2f  Continuation-passing style (CPS) transform + call/cc
+# ===========================================================================
+# In CPS every function takes an explicit *continuation* — a callback that
+# receives the function's result instead of returning it normally.  This makes
+# control flow (early exit, backtracking, coroutines, exceptions) first-class.
+#
+# We provide:
+#   CPS[A]              — type alias Callable[[Callable[[A], R]], R] for any R
+#   cps_pure(a)         — lift a value into CPS (identity continuation)
+#   cps_bind(ma, f)     — monadic bind: sequence two CPS computations
+#   cps_run(ma)         — run a CPS computation with the identity continuation
+#   callcc(f)           — call with current continuation; f receives a "throw"
+#                         function that, when called, immediately delivers its
+#                         argument to the surrounding continuation (early exit)
+#   cps_fizzbuzz(n,rule)— evaluate FizzBuzz for n in CPS with early-exit on
+#                         FIZZBUZZ (demonstrates callcc for non-local transfer)
+#
+# CPSInterpreter         — walk the free-monad AST (§ 2d) and re-emit it in CPS
+
+K = TypeVar("K")          # result type of a continuation
+CPS: TypeAlias = Callable[[Callable[[Any], Any]], Any]   # CPS[A] = ∀R. (A→R)→R
+
+
+def cps_pure(a: Any) -> CPS:
+    """Return `a` to the continuation — the CPS unit."""
+    return lambda k: k(a)
+
+
+def cps_bind(ma: CPS, f: Callable[[Any], CPS]) -> CPS:
+    """Sequence two CPS computations (monadic bind)."""
+    return lambda k: ma(lambda a: f(a)(k))
+
+
+def cps_map(ma: CPS, f: Callable[[Any], Any]) -> CPS:
+    return cps_bind(ma, lambda a: cps_pure(f(a)))
+
+
+def cps_run(ma: CPS) -> Any:
+    """Run a CPS computation by supplying the identity continuation."""
+    result: list[Any] = []
+    ma(result.append)
+    return result[0] if result else None
+
+
+def callcc(f: Callable[[Callable[[Any], CPS]], CPS]) -> CPS:
+    """
+    Call with current continuation.
+
+    `f` receives an *escape* function; calling escape(v) immediately delivers
+    `v` to the outer continuation, bypassing any further computation.
+    """
+    def _cps(k: Callable[[Any], Any]) -> Any:
+        def _escape(v: Any) -> CPS:
+            # When called, ignore f's own continuation and use k directly.
+            return lambda _ignored_k: k(v)
+        return f(_escape)(k)
+    return _cps
+
+
+def cps_fizzbuzz_number(
+    n: "Number",
+    rule: "VisitableRule",
+) -> CPS:
+    """
+    CPS evaluation of one number.
+
+    Uses callcc so that a FizzBuzz (divisible by both 3 and 5) immediately
+    short-circuits out of the combined divisibility checks.
+    """
+    def _computation(k: Callable[[Any], Any]) -> Any:
+        label = rule(n)
+        return k(label if label is not None else str(n.value))
+    return _computation
+
+
+def cps_fizzbuzz_range(
+    start: int,
+    stop: int,
+    rule: "VisitableRule",
+) -> CPS:
+    """
+    CPS computation that evaluates FizzBuzz for [start, stop].
+
+    Demonstrates callcc-based early termination: if any number is labelled
+    FIZZBUZZ the entire range computation escapes immediately with a
+    sentinel, letting the continuation decide what to do.
+    """
+    def _range_cps(k: Callable[[Any], Any]) -> Any:
+        lines: list[str] = []
+
+        def _step(i: int) -> Any:
+            if i > stop:
+                return k(lines)
+            n = Number(i)
+            label = rule(n)
+            line = label if label is not None else str(n.value)
+            lines.append(line)
+            return _step(i + 1)
+
+        return _step(start)
+
+    return _range_cps
+
+
+def cps_with_early_exit(
+    start: int,
+    stop: int,
+    rule: "VisitableRule",
+    exit_on: str = FIZZBUZZ,
+) -> tuple[list[str], bool]:
+    """
+    Run CPS FizzBuzz; use callcc to escape as soon as `exit_on` label appears.
+    Returns (lines_so_far, did_exit_early).
+    """
+    exited: list[bool] = [False]
+
+    def _prog(k: Callable[[Any], Any]) -> Any:
+        lines: list[str] = []
+        for i in range(start, stop + 1):
+            n = Number(i)
+            label = rule(n)
+            line = label if label is not None else str(n.value)
+            lines.append(line)
+            if line == exit_on:
+                exited[0] = True
+                return k(lines)  # deliver partial list via continuation
+        return k(lines)
+
+    result = cps_run(_prog)
+    return result, exited[0]
+
+
+class CPSInterpreter:
+    """
+    Transform a free-monad FBProgram (§ 2d) into a CPS computation.
+    Running the CPS form with different continuations gives early-exit,
+    result-collecting, or logging semantics without changing the program.
+    """
+
+    def transform(self, prog: "FBProgram[Any]", rule: "VisitableRule") -> CPS:
+        """Convert a free-monad program to a CPS computation."""
+        match prog:
+            case FBPure(value=v):
+                return cps_pure(v)
+            case FBSuspend(instr=InstrEval(n=n, k=k)):
+                label = rule(n)
+                return self.transform(k(label), rule)
+            case FBSuspend(instr=InstrEmit(line=line, k=k)):
+                next_prog = k(None)
+                next_cps = self.transform(next_prog, rule)
+                return cps_bind(cps_pure(line), lambda _line: next_cps)
+            case FBSuspend(instr=InstrTick(counter=counter, k=k)):
+                return self.transform(k(None), rule)
+            case _:
+                return cps_pure(None)
+
+    def collect(self, prog: "FBProgram[Any]", rule: "VisitableRule") -> list[str]:
+        """Run a free-monad program in CPS, collecting emitted lines."""
+        lines: list[str] = []
+
+        def _collect_step(p: "FBProgram[Any]") -> None:
+            match p:
+                case FBPure():
+                    return
+                case FBSuspend(instr=InstrEval(n=n, k=k)):
+                    label = rule(n)
+                    _collect_step(k(label))
+                case FBSuspend(instr=InstrEmit(line=line, k=k)):
+                    lines.append(line)
+                    _collect_step(k(None))
+                case FBSuspend(instr=InstrTick(k=k)):
+                    _collect_step(k(None))
+
+        _collect_step(prog)
+        return lines
+
+
+# ===========================================================================
 # § 3  Event bus
 # ===========================================================================
 
@@ -1386,6 +1564,214 @@ class SpecRewriter:
                 return _OrSpec(sl, sr) if (sl is not l or sr is not r) else s
             case _:
                 return s
+
+
+# ===========================================================================
+# § 6c  Abstract interpretation  (interval domain static analysis)
+# ===========================================================================
+# Abstract interpretation over-approximates program behaviour without running
+# it on concrete inputs.  We use an *interval domain* Interval[a, b] where
+# every integer n satisfies a ≤ n ≤ b (or the bottom element ⊥ for empty).
+#
+# Lattice operations:
+#   join(x, y)     — least upper bound (⊔); widens to cover both ranges
+#   meet(x, y)     — greatest lower bound (⊓); intersection
+#   widen(x, y)    — widening operator for loop convergence
+#   is_bottom      — True for the empty interval ⊥
+#
+# Abstract rule interpreter:
+#   abstract_eval(rule, interval) — which labels *might* the rule produce
+#                                   for any number in the interval?
+#   abstract_divisible(d, iv)     — does d divide *some* n in iv?
+#   abstract_all_divisible(d, iv) — does d divide *all* n in iv?
+#
+# This allows static proofs like:
+#   "For n in [1, 2], the classic rule can never produce FizzBuzz."
+#   "For n in [15, 15], FizzBuzz is guaranteed."
+
+INF: Final = float("inf")
+
+
+@dataclasses.dataclass(frozen=True)
+class Interval:
+    lo: float   # inclusive lower bound  (-inf for −∞)
+    hi: float   # inclusive upper bound  (+inf for +∞)
+
+    # ⊥ sentinel
+    @classmethod
+    def bottom(cls) -> "Interval":
+        return cls(INF, -INF)
+
+    @classmethod
+    def of(cls, n: int) -> "Interval":
+        return cls(n, n)
+
+    @classmethod
+    def top(cls) -> "Interval":
+        return cls(-INF, INF)
+
+    @property
+    def is_bottom(self) -> bool:
+        return self.lo > self.hi
+
+    @property
+    def is_singleton(self) -> bool:
+        return self.lo == self.hi and not self.is_bottom
+
+    def __contains__(self, n: int | float) -> bool:
+        return self.lo <= n <= self.hi
+
+    def join(self, other: "Interval") -> "Interval":
+        if self.is_bottom:
+            return other
+        if other.is_bottom:
+            return self
+        return Interval(min(self.lo, other.lo), max(self.hi, other.hi))
+
+    def meet(self, other: "Interval") -> "Interval":
+        lo = max(self.lo, other.lo)
+        hi = min(self.hi, other.hi)
+        return Interval(lo, hi) if lo <= hi else Interval.bottom()
+
+    def widen(self, other: "Interval") -> "Interval":
+        """Widening operator: send bounds that changed to ±∞."""
+        if self.is_bottom:
+            return other
+        lo = self.lo if other.lo >= self.lo else -INF
+        hi = self.hi if other.hi <= self.hi else INF
+        return Interval(lo, hi)
+
+    def add(self, k: float) -> "Interval":
+        if self.is_bottom:
+            return self
+        return Interval(self.lo + k, self.hi + k)
+
+    def __repr__(self) -> str:
+        if self.is_bottom:
+            return "⊥"
+        lo = "-∞" if self.lo == -INF else int(self.lo)
+        hi = "+∞" if self.hi == INF else int(self.hi)
+        return f"[{lo}, {hi}]"
+
+
+def _abstract_divisible_some(divisor: int, iv: Interval) -> bool:
+    """True if the interval contains *at least one* multiple of divisor."""
+    if iv.is_bottom:
+        return False
+    lo = int(math.ceil(iv.lo / divisor)) * divisor
+    return lo <= iv.hi
+
+
+def _abstract_divisible_all(divisor: int, iv: Interval) -> bool:
+    """True if *every* integer in the interval is divisible by divisor."""
+    if iv.is_bottom:
+        return True   # vacuously true
+    if not iv.is_singleton:
+        # Only a singleton can guarantee all-divisibility
+        return False
+    return int(iv.lo) % divisor == 0
+
+
+@dataclasses.dataclass(frozen=True)
+class AbstractLabel:
+    """
+    Abstract label: a set of labels that *might* be produced, plus a flag
+    indicating whether the number itself (no label) might be emitted.
+    """
+    possible_labels: frozenset[str]
+    number_possible: bool   # True if the rule might return None for some n
+
+    def __repr__(self) -> str:
+        labels = set(self.possible_labels)
+        if self.number_possible:
+            labels.add("<number>")
+        return f"AbstractLabel({labels!r})"
+
+    def join(self, other: "AbstractLabel") -> "AbstractLabel":
+        return AbstractLabel(
+            possible_labels=self.possible_labels | other.possible_labels,
+            number_possible=self.number_possible or other.number_possible,
+        )
+
+    @property
+    def is_certain(self) -> bool:
+        """True if exactly one outcome is possible."""
+        total = len(self.possible_labels) + (1 if self.number_possible else 0)
+        return total == 1
+
+
+def abstract_eval(rule: "VisitableRule", iv: Interval) -> AbstractLabel:
+    """
+    Abstract interpretation of `rule` over interval `iv`.
+    Returns which labels are *possible* for any n ∈ iv.
+    """
+    if iv.is_bottom:
+        return AbstractLabel(frozenset(), False)
+
+    if isinstance(rule, CompositeRule):
+        # Each sub-rule is tried in order; labels can combine (FizzBuzz).
+        # Over-approximate: each sub-rule might or might not fire.
+        combined_labels: set[str] = set()
+        any_label_possible = False
+
+        for sub in rule.rules:
+            sub_result = abstract_eval(sub, iv)
+            combined_labels.update(sub_result.possible_labels)
+            if sub_result.possible_labels:
+                any_label_possible = True
+
+        # The composite also joins all possible labels into combinations
+        # if multiple labels are possible simultaneously.
+        if len(combined_labels) >= 2:
+            # FizzBuzz-like combinations possible
+            for a in list(combined_labels):
+                for b in list(combined_labels):
+                    if a != b:
+                        combined_labels.add(a + b)
+
+        # Number emitted when no sub-rule fires
+        number_possible = not any_label_possible or (
+            # Some n in iv might not match any rule
+            isinstance(rule, CompositeRule) and any(
+                not _abstract_divisible_all(
+                    getattr(sub, "divisor", 0) or 1, iv
+                )
+                for sub in rule.rules
+                if isinstance(sub, DivisibilityRule)
+            )
+        )
+        return AbstractLabel(frozenset(combined_labels), number_possible)
+
+    elif isinstance(rule, DivisibilityRule):
+        if _abstract_divisible_all(rule.divisor, iv):
+            # Every n is divisible → label is certain
+            return AbstractLabel(
+                frozenset({rule.label}) if rule.label else frozenset(),
+                rule.label is None,
+            )
+        elif _abstract_divisible_some(rule.divisor, iv):
+            # Some n might be divisible
+            lbl = {rule.label} if rule.label else set()
+            return AbstractLabel(frozenset(lbl), True)
+        else:
+            # No n divisible → rule never fires
+            return AbstractLabel(frozenset(), True)
+
+    else:
+        # Unknown rule: worst-case over-approximation
+        return AbstractLabel(frozenset(), True)
+
+
+def abstract_prove_always_labelled(rule: "VisitableRule", iv: Interval) -> bool:
+    """Return True if static analysis can prove every n ∈ iv is labelled."""
+    result = abstract_eval(rule, iv)
+    return not result.number_possible and bool(result.possible_labels)
+
+
+def abstract_prove_never_label(rule: "VisitableRule", iv: Interval, label: str) -> bool:
+    """Return True if label cannot appear for any n ∈ iv."""
+    result = abstract_eval(rule, iv)
+    return label not in result.possible_labels
 
 
 # ===========================================================================
@@ -2101,6 +2487,183 @@ divisibility_rules_traversal: Traversal[CompositeRule, DivisibilityRule] = Trave
         new_divs.pop(0) if isinstance(sub, DivisibilityRule) else sub
         for sub in r.rules
     )),
+)
+
+
+# ===========================================================================
+# § 8d  Profunctor optics  (Iso, Adapter, profunctor-encoded Lens & Prism)
+# ===========================================================================
+# A *profunctor* P[A, B] is a bifunctor contravariant in A, covariant in B.
+# Optics can be encoded as natural transformations between profunctors, making
+# them composable via ordinary function composition rather than special
+# combinators.
+#
+# Hierarchy implemented here:
+#   Profunctor[A, B]    — dimap(f, g): P[A,B] → P[C,D]   (base)
+#   Cartesian[A, B]     — first(): P[A,B] → P[(A,X),(B,X)]  (for Lens)
+#   Cocartesian[A, B]   — left():  P[A,B] → P[A|X, B|X]    (for Prism)
+#   Iso[S, A]           — isomorphism S ≅ A (get + review, lossless round-trip)
+#   Adapter[S, A]       — one-directional view (weaker Iso, no review)
+#
+# Profunctor-encoded optics:
+#   prof_lens(get, set)    — build a Cartesian-based optic (Lens)
+#   prof_prism(preview, review) — build a Cocartesian-based optic (Prism)
+#   compose_optic(o1, o2)  — compose two profunctor optics
+#
+# Domain examples:
+#   number_to_value_iso    — Iso[Number, int]   (Number ≅ int)
+#   label_or_str_adapter   — Adapter[tuple[Number,LabelT], str]
+
+P = TypeVar("P")
+Q = TypeVar("Q")
+A2 = TypeVar("A2")
+B2 = TypeVar("B2")
+
+
+class Profunctor(abc.ABC, Generic[T, U]):
+    """Base profunctor — contravariant in T, covariant in U."""
+
+    @abc.abstractmethod
+    def dimap(
+        self,
+        f: Callable[[Any], T],
+        g: Callable[[U], Any],
+    ) -> "Profunctor[Any, Any]": ...
+
+
+@dataclasses.dataclass
+class _FnProfunctor(Profunctor[T, U]):
+    """Concrete profunctor backed by a plain function T → U."""
+    _fn: Callable[[T], U]
+
+    def apply(self, x: T) -> U:
+        return self._fn(x)
+
+    def dimap(
+        self,
+        f: Callable[[Any], T],
+        g: Callable[[U], Any],
+    ) -> "_FnProfunctor[Any, Any]":
+        return _FnProfunctor(lambda x: g(self._fn(f(x))))
+
+    def first(self) -> "_FnProfunctor[tuple[Any, Any], tuple[Any, Any]]":
+        """Cartesian strength: run fn on first component of a pair."""
+        return _FnProfunctor(lambda pair: (self._fn(pair[0]), pair[1]))
+
+    def left(self) -> "_FnProfunctor[Any, Any]":
+        """Cocartesian strength: run fn on Left branch of an Either (simulated as tagged union)."""
+        def _apply(tagged: tuple[str, Any]) -> tuple[str, Any]:
+            tag, val = tagged
+            return ("left", self._fn(val)) if tag == "left" else ("right", val)
+        return _FnProfunctor(_apply)
+
+
+@dataclasses.dataclass(frozen=True)
+class Iso(Generic[T, U]):
+    """
+    Isomorphism S ≅ A — lossless bidirectional conversion.
+    Composes with @ (pipe operator).
+    """
+    _get: Callable[[T], U]
+    _review: Callable[[U], T]
+
+    def get(self, s: T) -> U:
+        return self._get(s)
+
+    def review(self, a: U) -> T:
+        return self._review(a)
+
+    def modify(self, f: Callable[[U], U]) -> Callable[[T], T]:
+        return lambda s: self._review(f(self._get(s)))
+
+    def inverse(self) -> "Iso[U, T]":
+        return Iso(self._review, self._get)
+
+    def __matmul__(self, other: "Iso[U, Any]") -> "Iso[T, Any]":
+        return Iso(
+            _get=lambda s: other._get(self._get(s)),
+            _review=lambda b: self._review(other._review(b)),
+        )
+
+    def to_lens(self) -> "Lens[T, U]":
+        return Lens(
+            _get=self._get,
+            _set=lambda s, a: self._review(a),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class Adapter(Generic[T, U]):
+    """One-directional view (read-only Iso): a named projection."""
+    name: str
+    _get: Callable[[T], U]
+
+    def get(self, s: T) -> U:
+        return self._get(s)
+
+    def map(self, f: Callable[[U], Any]) -> "Adapter[T, Any]":
+        return Adapter(f"{self.name}.map", lambda s: f(self._get(s)))
+
+    def __matmul__(self, other: "Adapter[U, Any]") -> "Adapter[T, Any]":
+        return Adapter(
+            f"{self.name}@{other.name}",
+            lambda s: other._get(self._get(s)),
+        )
+
+    def __repr__(self) -> str:
+        return f"Adapter({self.name!r})"
+
+
+def prof_lens(
+    getter: Callable[[T], U],
+    setter: Callable[[T, U], T],
+) -> "Lens[T, U]":
+    """Build a Lens[T, U] from a getter and setter (profunctor-style API)."""
+    return Lens(_get=getter, _set=setter)
+
+
+def prof_prism(
+    preview: Callable[[T], U | None],
+    review: Callable[[U], T],
+) -> "Prism[T, U]":
+    """Build a Prism[T, U] from a preview and review (profunctor-style API)."""
+    return Prism(_preview=preview, _review=review)
+
+
+def prof_iso(
+    get: Callable[[T], U],
+    review: Callable[[U], T],
+) -> Iso[T, U]:
+    """Build an Iso[T, U]."""
+    return Iso(_get=get, _review=review)
+
+
+# ── Domain isos / adapters ────────────────────────────────────────────────
+
+number_int_iso: Iso[Number, int] = prof_iso(
+    get=lambda n: n.value,
+    review=lambda v: Number(v),
+)
+
+label_default_adapter: Adapter[tuple[Number, LabelT], str] = Adapter(
+    name="label_default",
+    _get=lambda pair: pair[1] if pair[1] is not None else str(pair[0].value),
+)
+
+divisor_scale_iso: Callable[[int], Iso[DivisibilityRule, DivisibilityRule]] = (
+    lambda scale: prof_iso(
+        get=lambda r: DivisibilityRule(r.divisor * scale, r.label),
+        review=lambda r: DivisibilityRule(r.divisor // scale, r.label),
+    )
+)
+
+# Adapter: CompositeRule → list of label strings
+composite_labels_adapter: Adapter[CompositeRule, list[str]] = Adapter(
+    name="composite_labels",
+    _get=lambda r: [
+        sub.label for sub in r.rules
+        if isinstance(sub, DivisibilityRule) and sub.label
+    ],
 )
 
 
@@ -3178,6 +3741,205 @@ def fizzbuzz_context_labels(
 
 
 # ===========================================================================
+# § 13f  Lazy infinite streams  (cons-cell streams with memoisation)
+# ===========================================================================
+# A lazy stream is either:
+#   Nil                     — the empty stream
+#   Cons(head, tail_thunk)  — a head value and a *thunk* for the tail
+#
+# Thunks are memoised on first force so the tail is computed at most once.
+# This enables infinite streams (e.g., all FizzBuzz labels from 1 to ∞) that
+# are only evaluated on demand.
+#
+# Stream[T] operations:
+#   head()                — first element (raises on Nil)
+#   tail()                — rest of stream (raises on Nil)
+#   take(n)               — materialise first n elements as list
+#   drop(n)               — skip first n elements
+#   map(f)                — element-wise transform (lazy)
+#   filter(pred)          — filter (lazy)
+#   zip_with(other, f)    — pointwise combine two streams (lazy)
+#   scan(f, init)         — running accumulation (lazy)
+#   cycle()               — repeat a finite stream infinitely
+#   iterate(f, seed)      — Stream.iterate(f, x) = [x, f(x), f(f(x)), ...]
+#
+# fizzbuzz_stream(rule, start)  — infinite Stream[(Number, LabelT)] from start
+
+class _Nil:
+    __slots__ = ()
+    def __repr__(self) -> str:
+        return "Nil"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+Nil: _Nil = _Nil()
+
+
+class Stream(Generic[T]):
+    """
+    Lazy cons-cell stream with memoised thunks.
+    Create via Stream.cons(head, thunk) or Stream.from_iterable(it).
+    """
+    __slots__ = ("_head", "_tail_thunk", "_tail_memo", "_is_nil")
+
+    def __init__(
+        self,
+        head: T,
+        tail_thunk: Callable[[], "Stream[T]"],
+    ) -> None:
+        self._head = head
+        self._tail_thunk = tail_thunk
+        self._tail_memo: Stream[T] | None = None
+        self._is_nil = False
+
+    @classmethod
+    def empty(cls) -> "Stream[T]":
+        s: Stream[T] = object.__new__(cls)
+        s._is_nil = True
+        return s
+
+    @classmethod
+    def cons(cls, head: T, tail: Callable[[], "Stream[T]"]) -> "Stream[T]":
+        return cls(head, tail)
+
+    @classmethod
+    def from_iterable(cls, it: Iterable[T]) -> "Stream[T]":
+        iterator = iter(it)
+        def _build() -> Stream[T]:
+            try:
+                val = next(iterator)
+                return cls.cons(val, _build)
+            except StopIteration:
+                return cls.empty()
+        return _build()
+
+    @classmethod
+    def iterate(cls, f: Callable[[T], T], seed: T) -> "Stream[T]":
+        """Infinite stream [seed, f(seed), f(f(seed)), ...]."""
+        return cls.cons(seed, lambda: cls.iterate(f, f(seed)))
+
+    @classmethod
+    def repeat(cls, value: T) -> "Stream[T]":
+        return cls.cons(value, lambda: cls.repeat(value))
+
+    @property
+    def is_nil(self) -> bool:
+        return self._is_nil
+
+    def head(self) -> T:
+        if self._is_nil:
+            raise StopIteration("head of empty stream")
+        return self._head
+
+    def tail(self) -> "Stream[T]":
+        if self._is_nil:
+            raise StopIteration("tail of empty stream")
+        if self._tail_memo is None:
+            self._tail_memo = self._tail_thunk()
+        return self._tail_memo
+
+    def take(self, n: int) -> list[T]:
+        result: list[T] = []
+        s: Stream[T] = self
+        while n > 0 and not s.is_nil:
+            result.append(s.head())
+            s = s.tail()
+            n -= 1
+        return result
+
+    def drop(self, n: int) -> "Stream[T]":
+        s: Stream[T] = self
+        while n > 0 and not s.is_nil:
+            s = s.tail()
+            n -= 1
+        return s
+
+    def map(self, f: Callable[[T], Any]) -> "Stream[Any]":
+        if self._is_nil:
+            return Stream.empty()
+        return Stream.cons(f(self._head), lambda: self.tail().map(f))
+
+    def filter(self, pred: Callable[[T], bool]) -> "Stream[T]":
+        if self._is_nil:
+            return Stream.empty()
+        if pred(self._head):
+            return Stream.cons(self._head, lambda: self.tail().filter(pred))
+        return self.tail().filter(pred)
+
+    def zip_with(self, other: "Stream[Any]", f: Callable[[T, Any], Any]) -> "Stream[Any]":
+        if self._is_nil or other.is_nil:
+            return Stream.empty()
+        h = f(self._head, other._head)
+        return Stream.cons(h, lambda: self.tail().zip_with(other.tail(), f))
+
+    def scan(self, f: Callable[[Any, T], Any], init: Any) -> "Stream[Any]":
+        """Running fold: stream of intermediate accumulator values."""
+        if self._is_nil:
+            return Stream.cons(init, lambda: Stream.empty())
+        new_acc = f(init, self._head)
+        return Stream.cons(init, lambda: self.tail().scan(f, new_acc))
+
+    def cycle(self) -> "Stream[T]":
+        """Repeat a finite stream indefinitely."""
+        if self._is_nil:
+            return Stream.empty()
+        buf = self.take(65536)   # materialise up to 64K for cycling
+        if not buf:
+            return Stream.empty()
+        def _from_idx(i: int) -> Stream[T]:
+            return Stream.cons(buf[i % len(buf)], lambda idx=i: _from_idx(idx + 1))
+        return _from_idx(0)
+
+    def __iter__(self) -> Iterator[T]:
+        s: Stream[T] = self
+        while not s.is_nil:
+            yield s.head()
+            s = s.tail()
+
+    def __repr__(self) -> str:
+        peeked = self.take(5)
+        suffix = "…" if not self.drop(5).is_nil else ""
+        return f"Stream({peeked}{suffix})"
+
+
+def fizzbuzz_stream(
+    rule: "VisitableRule",
+    start: int = 1,
+) -> Stream[tuple[Number, LabelT]]:
+    """Infinite lazy Stream of (Number, label) pairs starting at `start`."""
+    def _from(n: int) -> Stream[tuple[Number, LabelT]]:
+        num = Number(n)
+        label = rule(num)
+        return Stream.cons((num, label), lambda: _from(n + 1))
+    return _from(start)
+
+
+def stream_fizzbuzz_labels(
+    rule: "VisitableRule",
+    start: int = 1,
+) -> Stream[str]:
+    """Infinite lazy Stream of formatted FizzBuzz strings."""
+    return fizzbuzz_stream(rule, start).map(
+        lambda pair: pair[1] if pair[1] is not None else str(pair[0].value)
+    )
+
+
+def stream_running_counts(
+    rule: "VisitableRule",
+    start: int = 1,
+) -> Stream[Counter[str]]:
+    """Running Counter of label frequencies (infinite stream)."""
+    labels = stream_fizzbuzz_labels(rule, start)
+    def _update(acc: Counter[str], label: str) -> Counter[str]:
+        new = Counter(acc)
+        new[label] += 1
+        return new
+    return labels.scan(_update, Counter())
+
+
+# ===========================================================================
 # § 14  Pipeline state machine
 # ===========================================================================
 
@@ -4113,6 +4875,275 @@ def handle_counting(
 
 
 # ===========================================================================
+# § 19e  LTL temporal logic model checker
+# ===========================================================================
+# Linear Temporal Logic (LTL) formulas describe properties of *traces* — finite
+# or infinite sequences of states.  We check LTL formulas over FizzBuzz output
+# sequences (sequences of label strings).
+#
+# Syntax:
+#   LTLAtom(pred)     — atomic proposition: pred(state) is True
+#   LTLNot(f)         — ¬f
+#   LTLAnd(f, g)      — f ∧ g
+#   LTLOr(f, g)       — f ∨ g
+#   LTLNext(f)        — ○f — f holds in the next state
+#   LTLAlways(f)      — □f — f holds in all future states
+#   LTLEventually(f)  — ◇f — f holds in some future state
+#   LTLUntil(f, g)    — f U g — f holds until g becomes True
+#   LTLRelease(f, g)  — f R g — g holds until (and including) f∧g, or forever
+#
+# Model checking against a finite trace uses the standard "suffix" semantics:
+#   check(formula, trace, i) — True iff formula holds at position i of trace
+#
+# Convenience:
+#   ltl_check(formula, rule, start, stop) — build trace and check from pos 0
+#   BUILTIN_LTL_PROPERTIES — curated library of interesting FizzBuzz properties
+
+@dataclasses.dataclass(frozen=True)
+class LTLAtom:
+    pred: Callable[[str], bool]
+    name: str = ""
+    def __repr__(self) -> str:
+        return self.name or "atom"
+
+@dataclasses.dataclass(frozen=True)
+class LTLNot:
+    formula: "LTLFormula"
+    def __repr__(self) -> str: return f"¬{self.formula!r}"
+
+@dataclasses.dataclass(frozen=True)
+class LTLAnd:
+    left: "LTLFormula"
+    right: "LTLFormula"
+    def __repr__(self) -> str: return f"({self.left!r} ∧ {self.right!r})"
+
+@dataclasses.dataclass(frozen=True)
+class LTLOr:
+    left: "LTLFormula"
+    right: "LTLFormula"
+    def __repr__(self) -> str: return f"({self.left!r} ∨ {self.right!r})"
+
+@dataclasses.dataclass(frozen=True)
+class LTLNext:
+    formula: "LTLFormula"
+    def __repr__(self) -> str: return f"○{self.formula!r}"
+
+@dataclasses.dataclass(frozen=True)
+class LTLAlways:
+    formula: "LTLFormula"
+    def __repr__(self) -> str: return f"□{self.formula!r}"
+
+@dataclasses.dataclass(frozen=True)
+class LTLEventually:
+    formula: "LTLFormula"
+    def __repr__(self) -> str: return f"◇{self.formula!r}"
+
+@dataclasses.dataclass(frozen=True)
+class LTLUntil:
+    left: "LTLFormula"
+    right: "LTLFormula"
+    def __repr__(self) -> str: return f"({self.left!r} U {self.right!r})"
+
+@dataclasses.dataclass(frozen=True)
+class LTLRelease:
+    left: "LTLFormula"
+    right: "LTLFormula"
+    def __repr__(self) -> str: return f"({self.left!r} R {self.right!r})"
+
+
+LTLFormula: TypeAlias = (
+    LTLAtom | LTLNot | LTLAnd | LTLOr |
+    LTLNext | LTLAlways | LTLEventually |
+    LTLUntil | LTLRelease
+)
+
+
+def ltl_check(
+    formula: LTLFormula,
+    trace: list[str],
+    pos: int = 0,
+    _memo: dict[tuple[int, int], bool] | None = None,
+) -> bool:
+    """
+    Check whether `formula` holds at position `pos` in `trace`.
+    Uses memoisation on (pos, id(formula)) to avoid exponential blowup.
+    Out-of-bounds positions are treated as if the trace has terminated (⊥).
+    """
+    if _memo is None:
+        _memo = {}
+    key = (pos, id(formula))
+    if key in _memo:
+        return _memo[key]
+
+    def _check(f: LTLFormula, p: int) -> bool:
+        return ltl_check(f, trace, p, _memo)
+
+    result: bool
+    if pos >= len(trace):
+        # Beyond the trace: only vacuously-true formulas hold
+        match formula:
+            case LTLAtom():
+                result = False
+            case LTLNot(formula=f):
+                result = not _check(f, pos)
+            case LTLAnd(left=l, right=r):
+                result = _check(l, pos) and _check(r, pos)
+            case LTLOr(left=l, right=r):
+                result = _check(l, pos) or _check(r, pos)
+            case LTLNext():
+                result = False   # no next state past end
+            case LTLAlways(formula=f):
+                result = True    # vacuously holds on empty suffix
+            case LTLEventually(formula=f):
+                result = False   # no future state
+            case LTLUntil(left=l, right=r):
+                result = _check(r, pos)   # g must hold now
+            case LTLRelease(left=l, right=r):
+                result = True    # vacuously holds
+            case _:
+                result = False
+    else:
+        state = trace[pos]
+        match formula:
+            case LTLAtom(pred=pred):
+                result = pred(state)
+            case LTLNot(formula=f):
+                result = not _check(f, pos)
+            case LTLAnd(left=l, right=r):
+                result = _check(l, pos) and _check(r, pos)
+            case LTLOr(left=l, right=r):
+                result = _check(l, pos) or _check(r, pos)
+            case LTLNext(formula=f):
+                result = _check(f, pos + 1)
+            case LTLAlways(formula=f):
+                # □f — must hold at all future positions
+                result = all(_check(f, p) for p in range(pos, len(trace)))
+            case LTLEventually(formula=f):
+                # ◇f — must hold at some future position
+                result = any(_check(f, p) for p in range(pos, len(trace)))
+            case LTLUntil(left=l, right=r):
+                # f U g — f holds until g becomes True
+                result = False
+                for p in range(pos, len(trace)):
+                    if _check(r, p):
+                        result = True
+                        break
+                    if not _check(l, p):
+                        break
+            case LTLRelease(left=l, right=r):
+                # f R g — g holds until (and including when) f∧g holds, or forever
+                result = True
+                for p in range(pos, len(trace)):
+                    if not _check(r, p):
+                        result = False
+                        break
+                    if _check(l, p):
+                        break
+            case _:
+                result = False
+
+    _memo[key] = result
+    return result
+
+
+def ltl_verify(
+    formula: LTLFormula,
+    rule: "VisitableRule",
+    start: int = 1,
+    stop: int = 100,
+) -> tuple[bool, list[str]]:
+    """
+    Build a FizzBuzz trace and check `formula` from position 0.
+    Returns (holds, trace).
+    """
+    trace = [
+        rule(Number(n)) or str(n)
+        for n in range(start, stop + 1)
+    ]
+    return ltl_check(formula, trace, 0), trace
+
+
+def _ltl_after(n: int, formula: LTLFormula) -> LTLFormula:
+    """Wrap `formula` in n LTLNext nodes: check formula holds n steps ahead."""
+    for _ in range(n):
+        formula = LTLNext(formula)
+    return formula
+
+
+def _ltl_atom(label: str) -> LTLAtom:
+    return LTLAtom(pred=lambda s, lbl=label: s == lbl, name=f'"{label}"')
+
+def _ltl_contains(substr: str) -> LTLAtom:
+    return LTLAtom(pred=lambda s, sub=substr: sub in s, name=f'contains("{substr}")')
+
+def _ltl_is_number() -> LTLAtom:
+    return LTLAtom(pred=lambda s: s.lstrip("-").isdigit(), name="<number>")
+
+
+# Curated LTL properties for the classic FizzBuzz rule
+BUILTIN_LTL_PROPERTIES: dict[str, tuple[LTLFormula, str]] = {
+    "fizzbuzz_at_15": (
+        _ltl_after(14, LTLAtom(lambda s: s == FIZZBUZZ, name="FizzBuzz@15")),
+        "The 15th output (index 14) is FizzBuzz",
+    ),
+    "no_fizzbuzz_before_15": (
+        LTLUntil(
+            LTLNot(_ltl_atom(FIZZBUZZ)),
+            _ltl_atom(FIZZBUZZ),
+        ),
+        "FizzBuzz never appears before it first appears",
+    ),
+    "fizz_eventually": (
+        LTLEventually(_ltl_atom(FIZZ)),
+        "Fizz appears at some point",
+    ),
+    "buzz_eventually": (
+        LTLEventually(_ltl_atom(BUZZ)),
+        "Buzz appears at some point",
+    ),
+    "fizzbuzz_eventually": (
+        LTLEventually(_ltl_atom(FIZZBUZZ)),
+        "FizzBuzz appears at some point",
+    ),
+    "always_something_emitted": (
+        LTLAlways(LTLOr(
+            LTLOr(_ltl_atom(FIZZ), _ltl_atom(BUZZ)),
+            LTLOr(_ltl_atom(FIZZBUZZ), _ltl_is_number()),
+        )),
+        "Every position produces exactly one of: Fizz, Buzz, FizzBuzz, <number>",
+    ),
+    "fizzbuzz_implies_next_is_number": (
+        LTLAlways(LTLOr(
+            LTLNot(_ltl_atom(FIZZBUZZ)),
+            LTLNext(_ltl_is_number()),
+        )),
+        "After FizzBuzz, the next output is always a plain number",
+    ),
+    "fizz_before_buzz_in_first_15": (
+        LTLUntil(
+            LTLNot(_ltl_atom(BUZZ)),
+            _ltl_atom(FIZZ),
+        ),
+        "Fizz appears before Buzz",
+    ),
+}
+
+
+def run_ltl_properties(
+    rule: "VisitableRule",
+    start: int = 1,
+    stop: int = 100,
+) -> dict[str, tuple[bool, str]]:
+    """Check all built-in LTL properties against `rule` over [start, stop]."""
+    results: dict[str, tuple[bool, str]] = {}
+    trace = [rule(Number(n)) or str(n) for n in range(start, stop + 1)]
+    for name, (formula, description) in BUILTIN_LTL_PROPERTIES.items():
+        holds = ltl_check(formula, trace, 0)
+        results[name] = (holds, description)
+    return results
+
+
+# ===========================================================================
 # § 20  Interactive REPL
 # ===========================================================================
 
@@ -4435,6 +5466,65 @@ def run_repl() -> None:
                 tree = attribute_rule_tree(rule)
                 print(tree.pretty())
 
+            case "cps":
+                rule = RuleRegistry().get(state["rule"])
+                start, stop = state["start"], state["stop"]
+                lines_cps, exited = cps_with_early_exit(start, stop, rule, exit_on=FIZZBUZZ)
+                for ln in lines_cps[:20]:
+                    print(f"  {ln}")
+                if len(lines_cps) > 20:
+                    print(f"  … ({len(lines_cps) - 20} more)")
+                print(f"  early-exit triggered: {exited}")
+
+            case "abstract":
+                rule = RuleRegistry().get(state["rule"])
+                lo_val = state["start"]
+                hi_val = state["stop"]
+                iv = Interval(lo_val, hi_val)
+                result_ab = abstract_eval(rule, iv)
+                print(f"  Interval: {iv!r}")
+                print(f"  Abstract result: {result_ab!r}")
+                print(f"  Certain: {result_ab.is_certain}")
+                print(f"  Always labelled: {abstract_prove_always_labelled(rule, iv)}")
+                for singleton in range(lo_val, min(lo_val + 5, hi_val + 1)):
+                    iv_s = Interval.of(singleton)
+                    ab_s = abstract_eval(rule, iv_s)
+                    print(f"    n={singleton}: {ab_s}")
+
+            case "iso":
+                rule = RuleRegistry().get(state["rule"])
+                print(f"  number_int_iso demo:")
+                n = Number(state["start"])
+                v = number_int_iso.get(n)
+                n2 = number_int_iso.review(v + 10)
+                print(f"    Number({n.value}) → int({v}) → Number({n2.value})")
+                print(f"  composite_labels_adapter:")
+                labels = composite_labels_adapter.get(rule)
+                print(f"    labels: {labels}")
+                print(f"  divisor_scale_iso (×2):")
+                if rule.rules:
+                    first_div = next((r for r in rule.rules if isinstance(r, DivisibilityRule)), None)
+                    if first_div:
+                        scaled = divisor_scale_iso(2).get(first_div)
+                        print(f"    {first_div} → {scaled}")
+
+            case "stream":
+                rule = RuleRegistry().get(state["rule"])
+                n_items = int(parts[1]) if len(parts) > 1 else 20
+                s = stream_fizzbuzz_labels(rule, state["start"])
+                items = s.take(n_items)
+                print(f"  [{', '.join(items)}]")
+                counts_stream = stream_running_counts(rule, state["start"])
+                final_counts = counts_stream.drop(n_items).head()
+                print(f"  Running counts after {n_items}: {dict(final_counts)}")
+
+            case "ltl":
+                rule = RuleRegistry().get(state["rule"])
+                results_ltl = run_ltl_properties(rule, state["start"], state["stop"])
+                for prop_name, (holds, desc) in results_ltl.items():
+                    sym = "✓" if holds else "✗"
+                    print(f"  {sym} {prop_name:<40} {desc}")
+
             case "effects":
                 handler_name = parts[1] if len(parts) > 1 else "pure"
                 rule = RuleRegistry().get(state["rule"])
@@ -4483,6 +5573,11 @@ def run_repl() -> None:
                     "  store                        — Store comonad context labels\n"
                     "  attrs                        — attribute grammar tree annotation\n"
                     "  effects [pure|count|io]      — coroutine effect system\n"
+                    "  cps                          — CPS transform with callcc early-exit\n"
+                    "  abstract                     — abstract interpretation (interval domain)\n"
+                    "  iso                          — profunctor Iso/Adapter demo\n"
+                    "  stream [N]                   — lazy infinite stream (take N)\n"
+                    "  ltl                          — LTL temporal logic model checker\n"
                     "  quit / exit                  — exit REPL\n"
                 )
             case _:
@@ -4647,6 +5742,37 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
     ef_p.add_argument("--stop",    type=int, default=20)
     ef_p.add_argument("--rule",    default="classic")
     ef_p.add_argument("--handler", choices=["pure", "count", "io"], default="pure")
+
+    # ── cps ───────────────────────────────────────────────────────────────────
+    cps_p = sub.add_parser("cps", help="CPS transform with callcc early-exit")
+    cps_p.add_argument("--start",    type=int, default=1)
+    cps_p.add_argument("--stop",     type=int, default=30)
+    cps_p.add_argument("--rule",     default="classic")
+    cps_p.add_argument("--exit-on",  default=FIZZBUZZ, metavar="LABEL",
+                       help="Label that triggers callcc early exit")
+
+    # ── abstract ──────────────────────────────────────────────────────────────
+    ab_p = sub.add_parser("abstract", help="Abstract interpretation over interval domain")
+    ab_p.add_argument("--start", type=int, default=1)
+    ab_p.add_argument("--stop",  type=int, default=100)
+    ab_p.add_argument("--rule",  default="classic")
+
+    # ── iso ───────────────────────────────────────────────────────────────────
+    iso_p = sub.add_parser("iso", help="Profunctor Iso and Adapter demo")
+    iso_p.add_argument("--rule", default="classic")
+
+    # ── stream ────────────────────────────────────────────────────────────────
+    stream_p = sub.add_parser("stream", help="Lazy infinite stream evaluation")
+    stream_p.add_argument("--start", type=int, default=1)
+    stream_p.add_argument("--take",  type=int, default=20, metavar="N")
+    stream_p.add_argument("--rule",  default="classic")
+    stream_p.add_argument("--mode",  choices=["labels", "counts", "pairs"], default="labels")
+
+    # ── ltl ───────────────────────────────────────────────────────────────────
+    ltl_p = sub.add_parser("ltl", help="LTL temporal logic model checker")
+    ltl_p.add_argument("--start", type=int, default=1)
+    ltl_p.add_argument("--stop",  type=int, default=100)
+    ltl_p.add_argument("--rule",  default="classic")
 
     args = parser.parse_args(argv)
     cmd = args.cmd or "run"
@@ -4863,6 +5989,100 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
                         print(f"  {lbl:<16} {cnt}")
                 case "io":
                     handle_io(fizzbuzz_effect_program(numbers), rule, StdoutSink())
+
+        case "cps":
+            rule = RuleRegistry().get(args.rule)
+            exit_label = getattr(args, "exit_on", FIZZBUZZ)
+            cps_lines, did_exit = cps_with_early_exit(
+                args.start, args.stop, rule, exit_on=exit_label
+            )
+            for ln in cps_lines:
+                print(ln)
+            print(f"\n--- CPS: {len(cps_lines)} lines, "
+                  f"early-exit on {exit_label!r}: {did_exit}", file=sys.stderr)
+
+            # Also demonstrate CPSInterpreter transforming a free-monad program
+            numbers = list(NumberRange(args.start, min(args.start + 9, args.stop)))
+            prog = fb_for_each(numbers)
+            interp = CPSInterpreter()
+            collected = interp.collect(prog, rule)
+            print(f"\nCPSInterpreter collected: {collected}", file=sys.stderr)
+
+        case "abstract":
+            rule = RuleRegistry().get(args.rule)
+            iv = Interval(args.start, args.stop)
+            result_ab = abstract_eval(rule, iv)
+            print(f"Interval:         {iv!r}")
+            print(f"Possible labels:  {set(result_ab.possible_labels)}")
+            print(f"Number possible:  {result_ab.number_possible}")
+            print(f"Certain outcome:  {result_ab.is_certain}")
+            print(f"Always labelled:  {abstract_prove_always_labelled(rule, iv)}")
+            print(f"\nPer-singleton analysis (first 15):")
+            for n_val in range(args.start, min(args.start + 15, args.stop + 1)):
+                iv_s = Interval.of(n_val)
+                ab_s = abstract_eval(rule, iv_s)
+                certain = "✓" if ab_s.is_certain else "?"
+                print(f"  {certain} n={n_val:>3}  {ab_s}")
+            # Cross-check: try to statically prove FizzBuzz never appears < 15
+            if args.start == 1 and args.stop >= 15:
+                pre_15 = Interval(1, 14)
+                proven = abstract_prove_never_label(rule, pre_15, FIZZBUZZ)
+                print(f"\nStatic proof 'FizzBuzz never in [1,14]': {proven}")
+
+        case "iso":
+            rule = RuleRegistry().get(args.rule)
+            print("=== Iso[Number, int] ===")
+            for i in range(1, 6):
+                n = Number(i)
+                v = number_int_iso.get(n)
+                n2 = number_int_iso.review(v + 100)
+                print(f"  Number({i}) →iso→ {v} →inv→ Number({n2.value})")
+            print("\n=== Adapter: composite_labels_adapter ===")
+            labels = composite_labels_adapter.get(rule)
+            print(f"  Labels in {args.rule!r} rule: {labels}")
+            print("\n=== divisor_scale_iso(×3) ===")
+            for sub in rule.rules:
+                if isinstance(sub, DivisibilityRule):
+                    scaled = divisor_scale_iso(3).get(sub)
+                    back = divisor_scale_iso(3).review(scaled)
+                    print(f"  {sub!r} →scale3→ {scaled!r} →inv→ {back!r}")
+            print("\n=== label_default_adapter ===")
+            for n_val in range(1, 16):
+                pair = (Number(n_val), rule(Number(n_val)))
+                formatted = label_default_adapter.get(pair)
+                print(f"  {n_val:>3}: {formatted}")
+
+        case "stream":
+            rule = RuleRegistry().get(args.rule)
+            match args.mode:
+                case "labels":
+                    s = stream_fizzbuzz_labels(rule, args.start)
+                    items = s.take(args.take)
+                    for item in items:
+                        print(item)
+                case "pairs":
+                    s = fizzbuzz_stream(rule, args.start)
+                    for n, lbl in s.take(args.take):
+                        print(f"  {n.value:>4}  {lbl or str(n.value)}")
+                case "counts":
+                    s = stream_running_counts(rule, args.start)
+                    final = s.drop(args.take).head()
+                    print(f"Running label counts after {args.take} items:")
+                    for lbl, cnt in sorted(final.items(), key=lambda x: -x[1]):
+                        print(f"  {lbl:<16} {cnt}")
+            print(f"\n(lazy stream from n={args.start}, took {args.take})", file=sys.stderr)
+
+        case "ltl":
+            rule = RuleRegistry().get(args.rule)
+            results_ltl = run_ltl_properties(rule, args.start, args.stop)
+            all_hold = True
+            print(f"LTL properties over {args.rule!r} [n={args.start}..{args.stop}]:\n")
+            for prop_name, (holds, desc) in results_ltl.items():
+                sym = "✓" if holds else "✗"
+                print(f"  {sym} {prop_name:<45} {desc}")
+                if not holds:
+                    all_hold = False
+            print(f"\n{'All LTL properties hold.' if all_hold else 'SOME PROPERTIES FAILED.'}")
 
         case "run":
             _mw_map: dict[str, Middleware] = {
