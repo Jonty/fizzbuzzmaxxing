@@ -61,6 +61,7 @@ import multiprocessing
 import operator
 import os
 import queue
+import random
 import re
 import sys
 import threading
@@ -105,10 +106,13 @@ logging.basicConfig(
 log = logging.getLogger("fizzbuzz.core")
 
 T = TypeVar("T")
+U = TypeVar("U")
 E = TypeVar("E")
 T_co = TypeVar("T_co", covariant=True)
 T_contra = TypeVar("T_contra", contravariant=True)
 N = TypeVar("N", int, float)
+Env = TypeVar("Env")
+W = TypeVar("W")
 LabelT: TypeAlias = str | None
 
 FIZZ: Final = "Fizz"
@@ -276,6 +280,297 @@ def safe(fn: Callable[..., T]) -> Callable[..., Result[T, Exception]]:
         except Exception as exc:
             return Err(exc)
     return wrapper
+
+
+# ===========================================================================
+# § 2b  Parser combinators  (monadic PEG parsers)
+# ===========================================================================
+# A Parser[T] wraps  (input: str, pos: int) → (T, new_pos) | None
+# None = failure; returning the tuple = success at new_pos.
+
+_ParseResult: TypeAlias = tuple[Any, int] | None
+
+
+@dataclasses.dataclass(frozen=True)
+class Parser(Generic[T]):
+    """Monadic parser combinator.  Combine with | (choice), >> (sequence-right),
+    << (sequence-left), .map(), .flat_map(), .optional(), many_p(), etc."""
+    _fn: Callable[[str, int], _ParseResult]
+
+    def __call__(self, s: str, pos: int = 0) -> _ParseResult:
+        return self._fn(s, pos)
+
+    def parse(self, s: str) -> Ok[T] | Err[str]:
+        src = s.strip()
+        r = self._fn(src, 0)
+        if r is None:
+            return Err(f"parse failed on {s!r}")
+        val, pos = r
+        if pos < len(src):
+            return Err(f"trailing input at {pos}: {src[pos:]!r}")
+        return Ok(val)
+
+    def map(self, f: Callable[[T], U]) -> Parser[U]:
+        def fn(s: str, pos: int) -> _ParseResult:
+            r = self._fn(s, pos)
+            return (f(r[0]), r[1]) if r else None
+        return Parser(fn)
+
+    def flat_map(self, f: Callable[[T], Parser[U]]) -> Parser[U]:
+        def fn(s: str, pos: int) -> _ParseResult:
+            r = self._fn(s, pos)
+            return f(r[0])._fn(s, r[1]) if r else None
+        return Parser(fn)
+
+    def __or__(self, other: Parser[T]) -> Parser[T]:
+        """Ordered choice: try self first, fall back to other."""
+        def fn(s: str, pos: int) -> _ParseResult:
+            return self._fn(s, pos) or other._fn(s, pos)
+        return Parser(fn)
+
+    def __rshift__(self, other: Parser[U]) -> Parser[U]:
+        """Sequence, discard left: self >> other."""
+        return self.flat_map(lambda _: other)
+
+    def __lshift__(self, other: Parser[Any]) -> Parser[T]:
+        """Sequence, discard right: self << other."""
+        return self.flat_map(lambda a: other.map(lambda _: a))
+
+    def optional(self, default: T | None = None) -> Parser[T | None]:
+        return self | _pure_p(default)
+
+    def label(self, name: str) -> Parser[T]:
+        return Parser(self._fn)  # hook for future error-enrichment
+
+
+def _pure_p(val: T) -> Parser[T]:
+    return Parser(lambda _s, pos: (val, pos))
+
+def _fail_p() -> Parser[Never]:
+    return Parser(lambda _s, _pos: None)
+
+def char_p(c: str) -> Parser[str]:
+    return Parser(lambda s, pos: (c, pos + 1) if pos < len(s) and s[pos] == c else None)
+
+def satisfy_p(pred: Callable[[str], bool]) -> Parser[str]:
+    def fn(s: str, pos: int) -> _ParseResult:
+        return (s[pos], pos + 1) if pos < len(s) and pred(s[pos]) else None
+    return Parser(fn)
+
+def string_p(target: str) -> Parser[str]:
+    n = len(target)
+    return Parser(lambda s, pos: (target, pos + n) if s[pos:pos + n] == target else None)
+
+def regex_p(pattern: str) -> Parser[str]:
+    _re = re.compile(pattern)
+    def fn(s: str, pos: int) -> _ParseResult:
+        m = _re.match(s, pos)
+        return (m.group(0), m.end()) if m else None
+    return Parser(fn)
+
+def regex_groups_p(pattern: str) -> Parser[tuple[str, ...]]:
+    """Like regex_p but returns the capture groups instead of the full match."""
+    _re = re.compile(pattern)
+    def fn(s: str, pos: int) -> _ParseResult:
+        m = _re.match(s, pos)
+        return (m.groups(), m.end()) if m else None
+    return Parser(fn)
+
+def many_p(p: Parser[T]) -> Parser[list[T]]:
+    def fn(s: str, pos: int) -> _ParseResult:
+        acc: list[Any] = []
+        while r := p._fn(s, pos):
+            acc.append(r[0])
+            pos = r[1]
+        return acc, pos
+    return Parser(fn)
+
+def many1_p(p: Parser[T]) -> Parser[list[T]]:
+    return p.flat_map(lambda first: many_p(p).map(lambda rest: [first, *rest]))
+
+def sepby_p(p: Parser[T], sep: Parser[Any]) -> Parser[list[T]]:
+    rest = sep >> p
+    return (p.flat_map(lambda h: many_p(rest).map(lambda t: [h, *t]))) | _pure_p([])
+
+def ws_p() -> Parser[str]:
+    return regex_p(r"\s*")
+
+def lexeme_p(p: Parser[T]) -> Parser[T]:
+    """Skip trailing whitespace after p."""
+    return p << ws_p()
+
+def integer_p() -> Parser[int]:
+    return lexeme_p(regex_p(r"-?\d+")).map(int)
+
+def word_p() -> Parser[str]:
+    """Non-whitespace run."""
+    return lexeme_p(regex_p(r"\S+"))
+
+def between_p(open_p: Parser[Any], p: Parser[T], close_p: Parser[Any]) -> Parser[T]:
+    return open_p >> p << close_p
+
+
+# ── Combinator-based rule DSL parser  ────────────────────────────────────────
+
+def _build_combinator_dsl_parser() -> Parser[CompositeRule]:
+    """Full PEG parser for the rule DSL using parser combinators.
+
+    Grammar (EBNF):
+        rule_spec  ::= ws token+ eof
+        token      ::= div_tok | prime_tok | perfect_tok | parity_tok | collatz_tok
+        div_tok    ::= integer ':' label
+        prime_tok  ::= 'prime' ':' label
+        perfect_tok::= 'perfect' ':' label
+        parity_tok ::= ('even'|'odd') ':' label
+        collatz_tok::= 'collatz' op integer ':' label
+        op         ::= '>=' | '<=' | '>' | '<' | '='
+        label      ::= non-whitespace+
+    """
+    label_p = word_p()
+    colon_p = lexeme_p(char_p(":"))
+
+    _OP_MAP: dict[str, str] = {">": "gt", "<": "lt", "=": "eq", ">=": "gte", "<=": "lte"}
+
+    div_tok: Parser[VisitableRule] = (
+        integer_p() << colon_p
+    ).flat_map(lambda d: label_p.map(lambda lbl: DivisibilityRule(d, lbl)))
+
+    def _pred_tok(keyword: str, pred: Callable[[Number], bool]) -> Parser[VisitableRule]:
+        return (lexeme_p(string_p(keyword)) >> colon_p >> label_p).map(
+            lambda lbl: PredicateRule(pred, lbl, description=keyword)
+        )
+
+    prime_tok   = _pred_tok("prime",   lambda n: n.is_prime)
+    perfect_tok = _pred_tok("perfect", lambda n: n.is_perfect)
+    even_tok    = _pred_tok("even",    lambda n: n.parity == Parity.EVEN)
+    odd_tok     = _pred_tok("odd",     lambda n: n.parity == Parity.ODD)
+
+    collatz_op_p = (
+        string_p(">=") | string_p("<=") | string_p(">") | string_p("<") | string_p("=")
+    )
+    collatz_tok: Parser[VisitableRule] = (
+        lexeme_p(string_p("collatz")) >> collatz_op_p.flat_map(
+            lambda op: integer_p().flat_map(
+                lambda threshold: (colon_p >> label_p).map(
+                    lambda lbl: PredicateRule(
+                        CollatzDepthSpec(threshold, _OP_MAP[op]).is_satisfied_by,
+                        lbl,
+                        description=f"collatz{op}{threshold}",
+                    )
+                )
+            )
+        )
+    )
+
+    token: Parser[VisitableRule] = (
+        collatz_tok | prime_tok | perfect_tok | even_tok | odd_tok | div_tok
+    )
+
+    return (ws_p() >> many1_p(token)).map(lambda rules: CompositeRule(tuple(rules)))
+
+
+_DSL_PARSER: Parser[CompositeRule] = _build_combinator_dsl_parser()
+
+
+def parse_rule_dsl_combinators(spec: str) -> Ok[CompositeRule] | Err[str]:
+    """Parse a rule DSL string using the full parser-combinator engine."""
+    return _DSL_PARSER.parse(spec)
+
+
+# ===========================================================================
+# § 2c  Monad transformers  (Reader, Writer)
+# ===========================================================================
+
+@dataclasses.dataclass(frozen=True)
+class Reader(Generic[Env, T_co]):
+    """Reader monad: a computation that depends on a shared read-only environment.
+
+    Sequencing: reader_a.flat_map(lambda a: reader_b) threads the same env through both.
+    """
+    run_reader: Callable[[Env], T_co]
+
+    def __call__(self, env: Env) -> T_co:
+        return self.run_reader(env)
+
+    def map(self, f: Callable[[T_co], U]) -> Reader[Env, U]:
+        return Reader(lambda env: f(self.run_reader(env)))
+
+    def flat_map(self, f: Callable[[T_co], Reader[Env, U]]) -> Reader[Env, U]:
+        return Reader(lambda env: f(self.run_reader(env)).run_reader(env))
+
+    def local(self, f: Callable[[Env], Env]) -> Reader[Env, T_co]:
+        """Run with a locally modified environment."""
+        return Reader(lambda env: self.run_reader(f(env)))
+
+    @staticmethod
+    def ask() -> Reader[Env, Env]:
+        return Reader(lambda env: env)
+
+    @staticmethod
+    def asks(f: Callable[[Env], U]) -> Reader[Env, U]:
+        return Reader(f)
+
+    @staticmethod
+    def pure(val: U) -> Reader[Any, U]:
+        return Reader(lambda _: val)
+
+
+@dataclasses.dataclass(frozen=True)
+class Writer(Generic[T_co]):
+    """Writer monad: a computation that produces a value alongside an append-only log.
+
+    The log is a tuple of strings (a free monoid under concatenation).
+    """
+    value: T_co
+    log: tuple[str, ...]
+
+    def map(self, f: Callable[[T_co], U]) -> Writer[U]:
+        return Writer(f(self.value), self.log)
+
+    def flat_map(self, f: Callable[[T_co], Writer[U]]) -> Writer[U]:
+        result = f(self.value)
+        return Writer(result.value, self.log + result.log)
+
+    @staticmethod
+    def pure(val: U) -> Writer[U]:
+        return Writer(val, ())
+
+    @staticmethod
+    def tell(msg: str) -> Writer[None]:
+        return Writer(None, (msg,))
+
+    @staticmethod
+    def listen(w: Writer[T_co]) -> Writer[tuple[T_co, tuple[str, ...]]]:
+        return Writer((w.value, w.log), w.log)
+
+    def run(self) -> tuple[T_co, list[str]]:
+        return self.value, list(self.log)
+
+
+@dataclasses.dataclass(frozen=True)
+class FizzBuzzEnv:
+    """Read-only environment threaded through Reader computations."""
+    rule: CompositeRule
+    formatter: Formatter
+    tracer: Tracer
+
+
+def evaluate_in_env(number: Number) -> Reader[FizzBuzzEnv, Writer[str]]:
+    """Monadic evaluation: reads rule+formatter from env, logs trace via Writer."""
+    return (
+        Reader.asks(lambda ctx: ctx.rule)
+        .flat_map(lambda rule:
+            Reader.asks(lambda ctx: ctx.formatter)
+            .map(lambda fmt: (
+                Writer.tell(f"eval n={number.value}")
+                .flat_map(lambda _: Writer.pure(rule(number)))
+                .flat_map(lambda label:
+                    Writer.tell(f"  → label={label!r}")
+                    .flat_map(lambda _: Writer.pure(fmt.format(number, label)))
+                )
+            ))
+        )
+    )
 
 
 # ===========================================================================
@@ -636,6 +931,112 @@ class CollatzDepthSpec(Spec):
 
 
 # ===========================================================================
+# § 6b  Spec term rewriter  (algebraic simplification)
+# ===========================================================================
+
+class _AlwaysTrueSpec(Spec):
+    def is_satisfied_by(self, _n: Number) -> bool: return True
+    def __repr__(self) -> str: return "⊤"
+
+class _AlwaysFalseSpec(Spec):
+    def is_satisfied_by(self, _n: Number) -> bool: return False
+    def __repr__(self) -> str: return "⊥"
+
+_TRUE_SPEC  = _AlwaysTrueSpec()
+_FALSE_SPEC = _AlwaysFalseSpec()
+
+
+class SpecRewriter:
+    """Applies algebraic identities to simplify Spec expression trees to fixpoint.
+
+    Rules applied (eagerly, left-to-right):
+        ~~S           → S              (double-negation elimination)
+        ~⊤            → ⊥
+        ~⊥            → ⊤
+        S & S         → S              (idempotence)
+        S | S         → S
+        S & ~S        → ⊥              (contradiction)
+        ~S & S        → ⊥
+        S | ~S        → ⊤              (excluded middle)
+        ~S | S        → ⊤
+        S & ⊤         → S              (identity)
+        ⊤ & S         → S
+        S | ⊥         → S
+        ⊥ | S         → S
+        S & ⊥         → ⊥              (annihilation)
+        ⊥ & S         → ⊥
+        S | ⊤         → ⊤
+        ⊤ | S         → ⊤
+    """
+
+    def rewrite(self, spec: Spec) -> Spec:
+        prev: Spec | None = None
+        current = spec
+        steps = 0
+        while prev is not current and steps < 64:
+            prev = current
+            current = self._step(current)
+            steps += 1
+        return current
+
+    def _step(self, s: Spec) -> Spec:
+        match s:
+            # Double negation
+            case _NotSpec(inner=_NotSpec(inner=inner)):
+                return self._step(inner)
+            # Negation of constants
+            case _NotSpec(inner=_AlwaysTrueSpec()):
+                return _FALSE_SPEC
+            case _NotSpec(inner=_AlwaysFalseSpec()):
+                return _TRUE_SPEC
+            # Recurse into Not
+            case _NotSpec(inner=inner):
+                simplified = self._step(inner)
+                return _NotSpec(simplified) if simplified is not inner else s
+            # Idempotence
+            case _AndSpec(left=l, right=r) if l == r:
+                return self._step(l)
+            case _OrSpec(left=l, right=r) if l == r:
+                return self._step(l)
+            # Contradiction / excluded middle
+            case _AndSpec(left=l, right=_NotSpec(inner=r)) if l == r:
+                return _FALSE_SPEC
+            case _AndSpec(left=_NotSpec(inner=l), right=r) if l == r:
+                return _FALSE_SPEC
+            case _OrSpec(left=l, right=_NotSpec(inner=r)) if l == r:
+                return _TRUE_SPEC
+            case _OrSpec(left=_NotSpec(inner=l), right=r) if l == r:
+                return _TRUE_SPEC
+            # Identity / annihilation for And
+            case _AndSpec(left=_AlwaysTrueSpec(), right=r):
+                return self._step(r)
+            case _AndSpec(left=l, right=_AlwaysTrueSpec()):
+                return self._step(l)
+            case _AndSpec(left=_AlwaysFalseSpec(), right=_):
+                return _FALSE_SPEC
+            case _AndSpec(left=_, right=_AlwaysFalseSpec()):
+                return _FALSE_SPEC
+            # Identity / annihilation for Or
+            case _OrSpec(left=_AlwaysFalseSpec(), right=r):
+                return self._step(r)
+            case _OrSpec(left=l, right=_AlwaysFalseSpec()):
+                return self._step(l)
+            case _OrSpec(left=_AlwaysTrueSpec(), right=_):
+                return _TRUE_SPEC
+            case _OrSpec(left=_, right=_AlwaysTrueSpec()):
+                return _TRUE_SPEC
+            # Recurse into And / Or
+            case _AndSpec(left=l, right=r):
+                sl, sr = self._step(l), self._step(r)
+                return _AndSpec(sl, sr) if (sl is not l or sr is not r) else s
+            case _OrSpec(left=l, right=r):
+                sl, sr = self._step(l), self._step(r)
+                return _OrSpec(sl, sr) if (sl is not l or sr is not r) else s
+            case _:
+                return s
+
+
+# ===========================================================================
 # § 7  Rule engine — chain of responsibility + visitor + DSL + compiler
 # ===========================================================================
 
@@ -984,6 +1385,112 @@ _bootstrap_registry()
 
 
 # ===========================================================================
+# § 8b  Merkle tree / content-addressable rule store
+# ===========================================================================
+
+@dataclasses.dataclass
+class MerkleNode:
+    digest: str
+    left: MerkleNode | None = None
+    right: MerkleNode | None = None
+    payload: Any = dataclasses.field(default=None, repr=False)
+
+    @staticmethod
+    def leaf(payload: Any) -> MerkleNode:
+        h = hashlib.sha256(repr(payload).encode()).hexdigest()
+        return MerkleNode(digest=h, payload=payload)
+
+    @staticmethod
+    def branch(left: MerkleNode, right: MerkleNode) -> MerkleNode:
+        h = hashlib.sha256((left.digest + right.digest).encode()).hexdigest()
+        return MerkleNode(digest=h, left=left, right=right)
+
+    @property
+    def is_leaf(self) -> bool:
+        return self.left is None and self.right is None
+
+    def short(self) -> str:
+        return self.digest[:12]
+
+
+def _build_merkle(items: Sequence[Any]) -> MerkleNode | None:
+    if not items:
+        return None
+    nodes = [MerkleNode.leaf(v) for v in items]
+    while len(nodes) > 1:
+        if len(nodes) % 2:
+            nodes.append(nodes[-1])  # duplicate last for odd count
+        nodes = [MerkleNode.branch(nodes[i], nodes[i + 1]) for i in range(0, len(nodes), 2)]
+    return nodes[0]
+
+
+class ContentAddressableRuleStore:
+    """Immutable, content-addressable store for CompositeRules backed by a Merkle tree.
+
+    Each stored rule is identified by the SHA-256 digest of its serialised form.
+    The Merkle root covers all stored rules in sorted-name order, giving a
+    single fingerprint for the entire rule set.
+    """
+
+    def __init__(self) -> None:
+        self._store: dict[str, tuple[CompositeRule, str]] = {}  # name → (rule, digest)
+        self._tree: MerkleNode | None = None
+        self._log = logging.getLogger("fizzbuzz.merkle")
+
+    def store(self, name: str, rule: CompositeRule) -> str:
+        v = RuleSerialiserVisitor()
+        rule.accept(v)
+        digest = hashlib.sha256(repr(v.serialise()).encode()).hexdigest()
+        self._store[name] = (rule, digest)
+        self._rebuild()
+        self._log.debug("Stored %r digest=%s root=%s", name, digest[:8], self.root_hash()[:8] if self.root_hash() else "—")
+        return digest
+
+    def _rebuild(self) -> None:
+        leaves = sorted(f"{n}:{d}" for n, (_, d) in self._store.items())
+        self._tree = _build_merkle(leaves)
+
+    def root_hash(self) -> str | None:
+        return self._tree.digest if self._tree else None
+
+    def get(self, name: str) -> CompositeRule:
+        entry = self._store.get(name)
+        if entry is None:
+            raise KeyError(f"Rule {name!r} not in store")
+        return entry[0]
+
+    def verify(self, name: str, expected_digest: str) -> bool:
+        entry = self._store.get(name)
+        return entry is not None and entry[1] == expected_digest
+
+    def audit(self) -> dict[str, str]:
+        """Returns {name: digest} for all stored rules."""
+        return {n: d for n, (_, d) in self._store.items()}
+
+    def proof_path(self, name: str) -> list[str]:
+        """Returns the sibling digests along the Merkle path for `name` (simplified)."""
+        if name not in self._store:
+            raise KeyError(name)
+        leaves = sorted(f"{n}:{d}" for n, (_, d) in self._store.items())
+        target = f"{name}:{self._store[name][1]}"
+        idx = leaves.index(target)
+        nodes = [MerkleNode.leaf(v) for v in leaves]
+        path: list[str] = []
+        while len(nodes) > 1:
+            if len(nodes) % 2:
+                nodes.append(nodes[-1])
+            sibling_idx = idx ^ 1
+            if sibling_idx < len(nodes):
+                path.append(nodes[sibling_idx].short())
+            nodes = [MerkleNode.branch(nodes[i], nodes[i + 1]) for i in range(0, len(nodes), 2)]
+            idx //= 2
+        return path
+
+
+_global_rule_store = ContentAddressableRuleStore()
+
+
+# ===========================================================================
 # § 9  Formatter strategy  (strategy + decorator chain)
 # ===========================================================================
 
@@ -1136,6 +1643,54 @@ class MetricsCollector:
         for label, count in self.top_labels():
             lines.append(f"  {label:<18} {count:>6}  ({count / total:.1%})")
         return "\n".join(lines)
+
+
+# ===========================================================================
+# § 10b  Bloom filter  (probabilistic label-seen cache)
+# ===========================================================================
+
+class BloomFilter:
+    """Space-efficient probabilistic membership test.
+
+    False positives are possible; false negatives are impossible.
+    Optimal bit-array size m and hash-count k are derived from expected
+    item count and desired false-positive rate.
+    """
+
+    def __init__(self, expected_items: int = 10_000, fp_rate: float = 0.01) -> None:
+        m = math.ceil(-expected_items * math.log(fp_rate) / (math.log(2) ** 2))
+        k = max(1, round((m / expected_items) * math.log(2)))
+        self._m = m
+        self._k = k
+        self._bits = bytearray(math.ceil(m / 8))
+        self._count = 0
+        logging.getLogger("fizzbuzz.bloom").debug(
+            "BloomFilter: m=%d bits, k=%d hashes, target fp_rate=%.2f%%", m, k, fp_rate * 100
+        )
+
+    def _positions(self, item: str) -> Iterator[int]:
+        for seed in range(self._k):
+            raw = hashlib.md5(f"{seed}\x00{item}".encode(), usedforsecurity=False).digest()
+            yield int.from_bytes(raw[:4], "little") % self._m
+
+    def add(self, item: str) -> None:
+        for pos in self._positions(item):
+            self._bits[pos >> 3] |= 1 << (pos & 7)
+        self._count += 1
+
+    def __contains__(self, item: str) -> bool:
+        return all(self._bits[pos >> 3] & (1 << (pos & 7)) for pos in self._positions(item))
+
+    def __len__(self) -> int:
+        return self._count
+
+    @property
+    def fill_ratio(self) -> float:
+        set_bits = sum(bin(b).count("1") for b in self._bits)
+        return set_bits / self._m
+
+    def estimated_fp_rate(self) -> float:
+        return (1 - math.exp(-self._k * self._count / self._m)) ** self._k
 
 
 # ===========================================================================
@@ -1375,6 +1930,226 @@ class ChainedNumberRange:
 
     def __repr__(self) -> str:
         return f"ChainedNumberRange({', '.join(repr(r) for r in self._ranges)})"
+
+
+# ===========================================================================
+# § 13b  Reactive Observable  (push-based stream with Rx-style operators)
+# ===========================================================================
+
+class Disposable:
+    def __init__(self, dispose_fn: Callable[[], None] = lambda: None) -> None:
+        self._fn = dispose_fn
+        self._disposed = False
+
+    def dispose(self) -> None:
+        if not self._disposed:
+            self._disposed = True
+            self._fn()
+
+    @property
+    def is_disposed(self) -> bool:
+        return self._disposed
+
+    @staticmethod
+    def empty() -> Disposable:
+        return Disposable()
+
+
+@dataclasses.dataclass
+class Observer(Generic[T]):
+    on_next: Callable[[T], None]
+    on_error: Callable[[Exception], None] = dataclasses.field(default=lambda e: None)
+    on_complete: Callable[[], None] = dataclasses.field(default=lambda: None)
+
+
+class Observable(Generic[T]):
+    """Cold observable: subscribing re-runs the producer for each subscriber.
+
+    Operators are lazy — nothing executes until .subscribe() or .collect()."""
+
+    def __init__(self, _subscribe: Callable[[Observer[T]], Disposable]) -> None:
+        self._sub_fn = _subscribe
+
+    def subscribe(
+        self,
+        on_next: Callable[[T], None],
+        on_error: Callable[[Exception], None] | None = None,
+        on_complete: Callable[[], None] | None = None,
+    ) -> Disposable:
+        return self._sub_fn(Observer(on_next, on_error or (lambda e: None), on_complete or (lambda: None)))
+
+    # ── operators ─────────────────────────────────────────────────────────────
+
+    def map(self, f: Callable[[T], U]) -> Observable[U]:
+        def sub(obs: Observer[U]) -> Disposable:
+            return self._sub_fn(Observer(
+                on_next=lambda x: obs.on_next(f(x)),
+                on_error=obs.on_error, on_complete=obs.on_complete,
+            ))
+        return Observable(sub)
+
+    def filter(self, pred: Callable[[T], bool]) -> Observable[T]:
+        def sub(obs: Observer[T]) -> Disposable:
+            return self._sub_fn(Observer(
+                on_next=lambda x: obs.on_next(x) if pred(x) else None,
+                on_error=obs.on_error, on_complete=obs.on_complete,
+            ))
+        return Observable(sub)
+
+    def take(self, n: int) -> Observable[T]:
+        def sub(obs: Observer[T]) -> Disposable:
+            remaining = [n]
+            d: list[Disposable] = []
+
+            def on_next(x: T) -> None:
+                if remaining[0] > 0:
+                    remaining[0] -= 1
+                    obs.on_next(x)
+                    if remaining[0] == 0:
+                        obs.on_complete()
+                        if d:
+                            d[0].dispose()
+
+            d.append(self._sub_fn(Observer(on_next, obs.on_error, obs.on_complete)))
+            return d[0]
+        return Observable(sub)
+
+    def skip(self, n: int) -> Observable[T]:
+        def sub(obs: Observer[T]) -> Disposable:
+            skipped = [0]
+            return self._sub_fn(Observer(
+                on_next=lambda x: obs.on_next(x) if (skipped.__setitem__(0, skipped[0] + 1) or skipped[0] > n) else None,
+                on_error=obs.on_error, on_complete=obs.on_complete,
+            ))
+        return Observable(sub)
+
+    def flat_map(self, f: Callable[[T], Observable[U]]) -> Observable[U]:
+        def sub(obs: Observer[U]) -> Disposable:
+            return self._sub_fn(Observer(
+                on_next=lambda x: f(x).subscribe(obs.on_next, obs.on_error),
+                on_error=obs.on_error, on_complete=obs.on_complete,
+            ))
+        return Observable(sub)
+
+    def reduce(self, fn: Callable[[U, T], U], initial: U) -> Observable[U]:
+        def sub(obs: Observer[U]) -> Disposable:
+            acc = [initial]
+            def on_complete() -> None:
+                obs.on_next(acc[0])
+                obs.on_complete()
+            return self._sub_fn(Observer(
+                on_next=lambda x: acc.__setitem__(0, fn(acc[0], x)),
+                on_error=obs.on_error, on_complete=on_complete,
+            ))
+        return Observable(sub)
+
+    def scan(self, fn: Callable[[U, T], U], initial: U) -> Observable[U]:
+        """Like reduce but emits running accumulator after each item."""
+        def sub(obs: Observer[U]) -> Disposable:
+            acc = [initial]
+            def on_next(x: T) -> None:
+                acc[0] = fn(acc[0], x)
+                obs.on_next(acc[0])
+            return self._sub_fn(Observer(on_next, obs.on_error, obs.on_complete))
+        return Observable(sub)
+
+    def do(self, f: Callable[[T], None]) -> Observable[T]:
+        """Side-effect tap without altering values."""
+        return self.map(lambda x: (f(x), x)[1])
+
+    def enumerate(self) -> Observable[tuple[int, T]]:
+        def sub(obs: Observer[tuple[int, T]]) -> Disposable:
+            idx = [0]
+            def on_next(x: T) -> None:
+                obs.on_next((idx[0], x))
+                idx[0] += 1
+            return self._sub_fn(Observer(on_next, obs.on_error, obs.on_complete))
+        return Observable(sub)
+
+    def collect(self) -> list[T]:
+        result: list[T] = []
+        self.subscribe(result.append)
+        return result
+
+    def first(self) -> T | None:
+        items = self.take(1).collect()
+        return items[0] if items else None
+
+    # ── constructors ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def from_iterable(it: Iterable[T]) -> Observable[T]:
+        def sub(obs: Observer[T]) -> Disposable:
+            try:
+                for item in it:
+                    obs.on_next(item)
+                obs.on_complete()
+            except Exception as exc:
+                obs.on_error(exc)
+            return Disposable.empty()
+        return Observable(sub)
+
+    @staticmethod
+    def of(*items: T) -> Observable[T]:
+        return Observable.from_iterable(items)
+
+    @staticmethod
+    def empty_obs() -> Observable[Never]:
+        return Observable(lambda obs: (obs.on_complete(), Disposable.empty())[1])
+
+    @staticmethod
+    def error_obs(exc: Exception) -> Observable[Never]:
+        return Observable(lambda obs: (obs.on_error(exc), Disposable.empty())[1])
+
+    @staticmethod
+    def range_obs(start: int, stop: int, step: int = 1) -> Observable[Number]:
+        return Observable.from_iterable(NumberRange(start, stop, step))
+
+
+class Subject(Observable[T], Generic[T]):
+    """Hot observable that is also an observer: push values imperatively."""
+
+    def __init__(self) -> None:
+        self._observers: list[Observer[T]] = []
+        self._done = False
+        self._error: Exception | None = None
+        super().__init__(self._do_subscribe)
+
+    def _do_subscribe(self, obs: Observer[T]) -> Disposable:
+        if self._done:
+            obs.on_complete()
+            return Disposable.empty()
+        if self._error:
+            obs.on_error(self._error)
+            return Disposable.empty()
+        self._observers.append(obs)
+        return Disposable(lambda: self._observers.remove(obs) if obs in self._observers else None)
+
+    def next(self, item: T) -> None:
+        for obs in list(self._observers):
+            obs.on_next(item)
+
+    def error(self, exc: Exception) -> None:
+        self._error = exc
+        for obs in list(self._observers):
+            obs.on_error(exc)
+        self._observers.clear()
+
+    def complete(self) -> None:
+        self._done = True
+        for obs in list(self._observers):
+            obs.on_complete()
+        self._observers.clear()
+
+
+def fizzbuzz_observable(
+    start: int = 1,
+    stop: int = 100,
+    rule_name: str = "classic",
+) -> Observable[tuple[Number, LabelT]]:
+    """Returns a cold Observable of (Number, label) pairs."""
+    rule = RuleRegistry().get(rule_name)
+    return Observable.from_iterable(NumberRange(start, stop)).map(lambda n: (n, rule(n)))
 
 
 # ===========================================================================
@@ -1740,6 +2515,238 @@ async def stream_fizzbuzz(
 
 
 # ===========================================================================
+# § 19b  Property-based testing  (Gen[T] monad + for_all + shrinking)
+# ===========================================================================
+
+@dataclasses.dataclass
+class Shrinker(Generic[T]):
+    """Produces progressively simpler candidates from a failing value."""
+    shrink: Callable[[T], Iterable[T]]
+
+    @staticmethod
+    def integer(lo: int = 0) -> Shrinker[int]:
+        def shrink(n: int) -> Iterable[int]:
+            if n == lo:
+                return
+            yield lo
+            mid = (n + lo) // 2
+            if mid != lo and mid != n:
+                yield mid
+            if n > 0:
+                yield n - 1
+            elif n < 0:
+                yield n + 1
+        return Shrinker(shrink)
+
+    @staticmethod
+    def listof(elem_shrinker: Shrinker[T]) -> Shrinker[list[T]]:
+        def shrink(xs: list[T]) -> Iterable[list[T]]:
+            if xs:
+                yield []
+                if len(xs) > 1:
+                    yield xs[:len(xs) // 2]
+                    yield xs[len(xs) // 2:]
+            for i, x in enumerate(xs):
+                for smaller in elem_shrinker.shrink(x):
+                    yield xs[:i] + [smaller] + xs[i + 1:]
+        return Shrinker(shrink)
+
+
+@dataclasses.dataclass
+class Gen(Generic[T]):
+    """Monadic random value generator.
+
+    Gen.integer(), Gen.number(), Gen.one_of(), Gen.list_of() are the
+    standard combinators. .map() and .flat_map() let you derive new
+    generators from existing ones.
+    """
+    _generate: Callable[[random.Random, int], T]
+    shrinker: Shrinker[T] | None = None
+
+    def sample(self, rng: random.Random | None = None, size: int = 10) -> T:
+        return self._generate(rng or random.Random(), size)
+
+    def map(self, f: Callable[[T], U]) -> Gen[U]:
+        return Gen(lambda rng, size: f(self._generate(rng, size)))
+
+    def flat_map(self, f: Callable[[T], Gen[U]]) -> Gen[U]:
+        return Gen(lambda rng, size: f(self._generate(rng, size))._generate(rng, size))
+
+    def filter(self, pred: Callable[[T], bool], max_tries: int = 100) -> Gen[T]:
+        def gen(rng: random.Random, size: int) -> T:
+            for _ in range(max_tries):
+                v = self._generate(rng, size)
+                if pred(v):
+                    return v
+            raise RuntimeError(f"Gen.filter: could not satisfy predicate in {max_tries} tries")
+        return Gen(gen)
+
+    def zip(self, other: Gen[U]) -> Gen[tuple[T, U]]:
+        return Gen(lambda rng, size: (self._generate(rng, size), other._generate(rng, size)))
+
+    # ── primitive generators ──────────────────────────────────────────────────
+
+    @staticmethod
+    def constant(val: T) -> Gen[T]:
+        return Gen(lambda _r, _s: val)
+
+    @staticmethod
+    def integer(lo: int = 0, hi: int = 1000) -> Gen[int]:
+        return Gen(
+            lambda rng, _: rng.randint(lo, hi),
+            shrinker=Shrinker.integer(lo),
+        )
+
+    @staticmethod
+    def number(lo: int = 1, hi: int = 1000) -> Gen[Number]:
+        return Gen.integer(lo, hi).map(Number)
+
+    @staticmethod
+    def number_range(max_size: int = 200) -> Gen[NumberRange]:
+        def gen(rng: random.Random, _size: int) -> NumberRange:
+            start = rng.randint(1, max_size)
+            stop  = rng.randint(start, start + max_size)
+            step  = rng.randint(1, 5)
+            return NumberRange(start, stop, step)
+        return Gen(gen)
+
+    @staticmethod
+    def one_of(*gens: Gen[T]) -> Gen[T]:
+        return Gen(lambda rng, size: rng.choice(gens)._generate(rng, size))
+
+    @staticmethod
+    def list_of(gen: Gen[T], min_size: int = 0, max_size: int = 10) -> Gen[list[T]]:
+        elem_shr = gen.shrinker
+        def gen_fn(rng: random.Random, size: int) -> list[T]:
+            n = rng.randint(min_size, max_size)
+            return [gen._generate(rng, size) for _ in range(n)]
+        return Gen(
+            gen_fn,
+            shrinker=Shrinker.listof(elem_shr) if elem_shr else None,
+        )
+
+    @staticmethod
+    def rule_name() -> Gen[str]:
+        names = RuleRegistry().names()
+        return Gen(lambda rng, _: rng.choice(names))
+
+
+@dataclasses.dataclass
+class PropertyResult:
+    passed: bool
+    trials: int
+    counterexample: tuple[Any, ...] | None = None
+    shrunk: tuple[Any, ...] | None = None
+    exception: Exception | None = None
+
+    def __str__(self) -> str:
+        if self.passed:
+            return f"✓ Passed {self.trials} trials"
+        ce = self.shrunk or self.counterexample
+        msg = f"✗ Failed after {self.trials} trials — counterexample: {ce!r}"
+        if self.exception:
+            msg += f"\n  Exception: {type(self.exception).__name__}: {self.exception}"
+        return msg
+
+
+def for_all(
+    *gens: Gen[Any],
+    prop: Callable[..., bool],
+    trials: int = 100,
+    seed: int | None = None,
+    max_shrink_steps: int = 100,
+) -> PropertyResult:
+    """Run a randomised property test over generated inputs, with shrinking on failure.
+
+    Example:
+        result = for_all(
+            Gen.number(1, 100),
+            prop=lambda n: (n.value % 3 == 0) == (RuleRegistry().get("classic")(n) is not None or True),
+            trials=200,
+        )
+    """
+    rng = random.Random(seed)
+
+    for trial in range(1, trials + 1):
+        inputs = tuple(g._generate(rng, min(trial, 50)) for g in gens)
+        exc: Exception | None = None
+        try:
+            passed = prop(*inputs)
+        except Exception as e:
+            passed = False
+            exc = e
+
+        if not passed:
+            best = inputs
+            for _ in range(max_shrink_steps):
+                found_smaller = False
+                for i, (val, gen) in enumerate(zip(best, gens)):
+                    shr = gen.shrinker
+                    if shr is None:
+                        continue
+                    for candidate_val in shr.shrink(val):
+                        candidate = best[:i] + (candidate_val,) + best[i + 1:]
+                        try:
+                            if not prop(*candidate):
+                                best = candidate
+                                found_smaller = True
+                                break
+                        except Exception:
+                            best = candidate
+                            found_smaller = True
+                            break
+                    if found_smaller:
+                        break
+                if not found_smaller:
+                    break
+
+            return PropertyResult(
+                passed=False,
+                trials=trial,
+                counterexample=inputs,
+                shrunk=best if best != inputs else None,
+                exception=exc,
+            )
+
+    return PropertyResult(passed=True, trials=trials)
+
+
+# ── Built-in FizzBuzz properties ──────────────────────────────────────────────
+
+def _prop_label_is_string_or_none(n: Number) -> bool:
+    label = RuleRegistry().get("classic")(n)
+    return label is None or isinstance(label, str)
+
+def _prop_fizz_iff_div3(n: Number) -> bool:
+    label = RuleRegistry().get("classic")(n) or ""
+    return (n.value % 3 == 0) == ("Fizz" in label)
+
+def _prop_buzz_iff_div5(n: Number) -> bool:
+    label = RuleRegistry().get("classic")(n) or ""
+    return (n.value % 5 == 0) == ("Buzz" in label)
+
+def _prop_compiled_matches_interpreted(n: Number) -> bool:
+    rule = RuleRegistry().get("classic")
+    compiled = RuleCompiler.compile(rule)
+    return rule(n) == compiled(n)
+
+BUILTIN_PROPERTIES: dict[str, Callable[[Number], bool]] = {
+    "label_type":           _prop_label_is_string_or_none,
+    "fizz_iff_div3":        _prop_fizz_iff_div3,
+    "buzz_iff_div5":        _prop_buzz_iff_div5,
+    "compiled_matches":     _prop_compiled_matches_interpreted,
+}
+
+
+def run_builtin_properties(trials: int = 200) -> dict[str, PropertyResult]:
+    results: dict[str, PropertyResult] = {}
+    for name, prop in BUILTIN_PROPERTIES.items():
+        gen = Gen.number(1, 10_000)
+        results[name] = for_all(gen, prop=prop, trials=trials)
+    return results
+
+
+# ===========================================================================
 # § 20  Interactive REPL
 # ===========================================================================
 
@@ -1856,6 +2863,97 @@ def run_repl() -> None:
             case "trace":
                 print(_global_tracer.dump())
 
+            case "bloom":
+                bf = BloomFilter(expected_items=1000)
+                rule = RuleRegistry().get(state["rule"])
+                seen: set[str] = set()
+                for n in NumberRange(state["start"], state["stop"]):
+                    label = rule(n) or str(n.value)
+                    bf.add(label)
+                    seen.add(label)
+                print(f"BloomFilter: {len(bf)} items, fill={bf.fill_ratio:.1%}, "
+                      f"est. fp_rate={bf.estimated_fp_rate():.4%}")
+                probes = ["Fizz", "Buzz", "FizzBuzz", "NotReal", "42"]
+                for p in probes:
+                    print(f"  {'✓' if p in bf else '✗'} {p!r}  (true={'yes' if p in seen else 'no'})")
+
+            case "merkle":
+                registry = RuleRegistry()
+                store = _global_rule_store
+                for name in registry.names():
+                    digest = store.store(name, registry.get(name))
+                    path = store.proof_path(name)
+                    print(f"  {name:<20} digest={digest[:16]}  proof={' → '.join(path) or '(root)'}")
+                print(f"\nMerkle root: {store.root_hash()}")
+
+            case "observe":
+                pairs = fizzbuzz_observable(state["start"], state["stop"], state["rule"]).collect()
+                labelled = sum(1 for _, lbl in pairs if lbl)
+                print(f"Observable emitted {len(pairs)} items, {labelled} labelled")
+                label_counts: Counter[str] = Counter(lbl or "<n>" for _, lbl in pairs)
+                for lbl, cnt in label_counts.most_common(5):
+                    print(f"  {lbl:<16} {cnt}")
+
+            case "rewrite":
+                if len(parts) < 2:
+                    print("Usage: rewrite <spec-expr>")
+                    print("Example: rewrite '~~DivisibleBy(3)' — expression built from Spec classes")
+                    print("Try: DivisibleBySpec(3) & ~_AlwaysFalseSpec()")
+                    continue
+                expr = " ".join(parts[1:])
+                try:
+                    spec_obj = eval(expr, {  # noqa: S307
+                        "DivisibleBySpec": DivisibleBySpec,
+                        "PrimeSpec": PrimeSpec,
+                        "PerfectSpec": PerfectSpec,
+                        "ParitySpec": ParitySpec,
+                        "Parity": Parity,
+                        "_AlwaysTrueSpec": _AlwaysTrueSpec,
+                        "_AlwaysFalseSpec": _AlwaysFalseSpec,
+                        "_AndSpec": _AndSpec,
+                        "_OrSpec": _OrSpec,
+                        "_NotSpec": _NotSpec,
+                    })
+                    rewritten = SpecRewriter().rewrite(spec_obj)
+                    print(f"  Before: {spec_obj!r}")
+                    print(f"  After:  {rewritten!r}")
+                except Exception as exc:
+                    print(f"Error: {exc}")
+
+            case "proptest":
+                n_trials = int(parts[1]) if len(parts) > 1 else 100
+                print(f"Running {len(BUILTIN_PROPERTIES)} built-in properties × {n_trials} trials …")
+                for name, result in run_builtin_properties(trials=n_trials).items():
+                    print(f"  {name:<30} {result}")
+
+            case "parse":
+                if len(parts) < 2:
+                    print("Usage: parse <dsl-spec>")
+                    continue
+                dsl_spec = " ".join(parts[1:])
+                result_p = parse_rule_dsl_combinators(dsl_spec)
+                if result_p.is_ok():
+                    rule = result_p.unwrap()
+                    RuleRegistry().register("_parsed", rule)
+                    state["rule"] = "_parsed"
+                    v = RuleExplainerVisitor()
+                    rule.accept(v)
+                    print(f"Parsed OK:\n{v.explain()}")
+                else:
+                    print(f"Parse error: {result_p.error}")
+
+            case "reader":
+                rule = RuleRegistry().get(state["rule"])
+                fmt  = FizzBuzzFactory._build_formatter(state["formatter"])
+                env  = FizzBuzzEnv(rule=rule, formatter=fmt, tracer=_global_tracer)
+                numbers = list(NumberRange(state["start"], min(state["start"] + 4, state["stop"])))
+                for n in numbers:
+                    writer = evaluate_in_env(n).run_reader(env)
+                    output, log_lines = writer.run()
+                    print(f"  {output}")
+                    for entry in log_lines:
+                        print(f"    [{entry}]")
+
             case "help":
                 print(
                     "  run / go                     — execute with current settings\n"
@@ -1865,7 +2963,14 @@ def run_repl() -> None:
                     "  analyse                      — static label-frequency analysis\n"
                     "  rules                        — list registered rules\n"
                     "  status                       — show current settings\n"
-                    "  dsl <spec>                   — define rule inline\n"
+                    "  dsl <spec>                   — define rule inline (simple)\n"
+                    "  parse <spec>                 — parse rule via combinator parser\n"
+                    "  rewrite <spec-expr>          — algebraically simplify a Spec\n"
+                    "  observe                      — run via Observable stream\n"
+                    "  bloom                        — build Bloom filter over labels\n"
+                    "  merkle                       — store rules in Merkle tree\n"
+                    "  proptest [N]                 — run built-in property tests\n"
+                    "  reader                       — evaluate via Reader+Writer monads\n"
                     "  trace                        — dump tracing spans\n"
                     "  quit / exit                  — exit REPL\n"
                 )
@@ -1960,6 +3065,28 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
     # ── repl ──────────────────────────────────────────────────────────────────
     sub.add_parser("repl", help="Start interactive REPL")
 
+    # ── proptest ──────────────────────────────────────────────────────────────
+    pt_p = sub.add_parser("proptest", help="Run built-in property-based tests")
+    pt_p.add_argument("--trials", type=int, default=200)
+
+    # ── observe ───────────────────────────────────────────────────────────────
+    obs_p = sub.add_parser("observe", help="Run via reactive Observable stream")
+    obs_p.add_argument("--start",  type=int, default=1)
+    obs_p.add_argument("--stop",   type=int, default=100)
+    obs_p.add_argument("--rule",   default="classic")
+    obs_p.add_argument("--take",   type=int, default=0, metavar="N", help="Emit only first N items")
+
+    # ── merkle ────────────────────────────────────────────────────────────────
+    sub.add_parser("merkle", help="Store all rules in content-addressable Merkle store")
+
+    # ── parse-dsl ─────────────────────────────────────────────────────────────
+    pd_p = sub.add_parser("parse-dsl", help="Parse a rule DSL via parser combinators")
+    pd_p.add_argument("spec", nargs="+")
+
+    # ── rewrite ───────────────────────────────────────────────────────────────
+    rw_p = sub.add_parser("rewrite", help="Algebraically simplify a Spec expression")
+    rw_p.add_argument("expr", nargs="+")
+
     args = parser.parse_args(argv)
     cmd = args.cmd or "run"
 
@@ -1975,6 +3102,69 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
 
         case "repl":
             run_repl()
+
+        case "proptest":
+            print(f"Running {len(BUILTIN_PROPERTIES)} built-in properties × {args.trials} trials …\n")
+            all_passed = True
+            for name, result in run_builtin_properties(trials=args.trials).items():
+                print(f"  {name:<35} {result}")
+                if not result.passed:
+                    all_passed = False
+            print(f"\n{'All properties passed.' if all_passed else 'SOME PROPERTIES FAILED.'}")
+
+        case "observe":
+            obs = fizzbuzz_observable(args.start, args.stop, args.rule)
+            if args.take > 0:
+                obs = obs.take(args.take)
+            formatter = FizzBuzzFactory._build_formatter("default")
+            counter: Counter[str] = Counter()
+            def _handle(pair: tuple[Number, LabelT]) -> None:
+                n, label = pair
+                print(formatter.format(n, label))
+                counter[label or "<number>"] += 1
+            obs.subscribe(_handle)
+            print(f"\n--- Observable stats: {sum(counter.values())} items", file=sys.stderr)
+            for lbl, cnt in counter.most_common():
+                print(f"  {lbl:<16} {cnt}", file=sys.stderr)
+
+        case "merkle":
+            registry = RuleRegistry()
+            store = _global_rule_store
+            for name in registry.names():
+                digest = store.store(name, registry.get(name))
+                path = store.proof_path(name)
+                print(f"  {name:<22} {digest[:24]}  proof=[{', '.join(path)}]")
+            print(f"\nMerkle root: {store.root_hash()}")
+
+        case "parse-dsl":
+            spec = " ".join(args.spec)
+            result_p = parse_rule_dsl_combinators(spec)
+            if result_p.is_ok():
+                rule = result_p.unwrap()
+                v = RuleExplainerVisitor()
+                rule.accept(v)
+                print(f"Parsed OK:\n{v.explain()}")
+            else:
+                print(f"Parse error: {result_p.error}", file=sys.stderr)
+                return 1
+
+        case "rewrite":
+            expr = " ".join(args.expr)
+            _rewrite_ns = {
+                "DivisibleBySpec": DivisibleBySpec, "PrimeSpec": PrimeSpec,
+                "PerfectSpec": PerfectSpec, "ParitySpec": ParitySpec,
+                "Parity": Parity, "_AlwaysTrueSpec": _AlwaysTrueSpec,
+                "_AlwaysFalseSpec": _AlwaysFalseSpec,
+                "_AndSpec": _AndSpec, "_OrSpec": _OrSpec, "_NotSpec": _NotSpec,
+            }
+            try:
+                spec_obj = eval(expr, _rewrite_ns)  # noqa: S307
+                simplified = SpecRewriter().rewrite(spec_obj)
+                print(f"Before : {spec_obj!r}")
+                print(f"After  : {simplified!r}")
+            except Exception as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
 
         case "run":
             _mw_map: dict[str, Middleware] = {
