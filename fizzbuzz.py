@@ -775,6 +775,157 @@ def fb_interpret_mock(
 
 
 # ===========================================================================
+# § 2e  Tagless final  (algebra-parameterized DSL — dual of free monad)
+# ===========================================================================
+# The free monad (§ 2d) builds an *AST* then interprets it.  Tagless final
+# inverts the approach: a *term* is a function `(Algebra) -> result` —
+# "plug in an algebra, get an answer."  There is no intermediate data
+# structure.  Swap the algebra instance to switch from printing to collecting
+# to counting to pretty-printing, without any pattern matching.
+#
+# FizzBuzzAlgebra[T] — three primitive operations + a sequencing combinator:
+#   eval_number(n)     → T   evaluate rule for n
+#   emit_line(line)    → T   produce one output line
+#   tick(tag)          → T   record a counter event
+#   sequence(items)    → T   combine a list of T values
+#
+# Provided algebras:
+#   _PrintingAlgebra    — IO side-effects via OutputSink
+#   _CollectingAlgebra  — accumulate lines into list[str]
+#   _CountingAlgebra    — tally labels via Counter[str]
+#   _PrettyPrintAlgebra — render the program as indented pseudo-code
+#   _TracingAlgebra     — wrap another algebra with span-level tracing
+
+class FizzBuzzAlgebra(abc.ABC, Generic[T_co]):
+    @abc.abstractmethod
+    def eval_number(self, n: "Number") -> T_co: ...
+    @abc.abstractmethod
+    def emit_line(self, line: str) -> T_co: ...
+    @abc.abstractmethod
+    def tick(self, tag: str) -> T_co: ...
+    @abc.abstractmethod
+    def sequence(self, items: list[T_co]) -> T_co: ...
+
+
+# A term is universally quantified over T — but Python doesn't have rank-2
+# types, so we represent it as Callable[[FizzBuzzAlgebra[Any]], Any].
+FinalTerm: TypeAlias = Callable[["FizzBuzzAlgebra[Any]"], Any]
+
+
+class _PrintingAlgebra(FizzBuzzAlgebra[None]):
+    def __init__(self, rule: "VisitableRule", sink: "OutputSink") -> None:
+        self._rule = rule
+        self._sink = sink
+
+    def eval_number(self, n: "Number") -> None:
+        label = self._rule(n)
+        self._sink.write(label if label is not None else str(n.value))
+
+    def emit_line(self, line: str) -> None:
+        self._sink.write(line)
+
+    def tick(self, tag: str) -> None:
+        pass
+
+    def sequence(self, items: list[None]) -> None:
+        return None
+
+
+class _CollectingAlgebra(FizzBuzzAlgebra[list[str]]):
+    def __init__(self, rule: "VisitableRule") -> None:
+        self._rule = rule
+
+    def eval_number(self, n: "Number") -> list[str]:
+        label = self._rule(n)
+        return [label if label is not None else str(n.value)]
+
+    def emit_line(self, line: str) -> list[str]:
+        return [line]
+
+    def tick(self, tag: str) -> list[str]:
+        return []
+
+    def sequence(self, items: list[list[str]]) -> list[str]:
+        return [line for sub in items for line in sub]
+
+
+class _CountingAlgebra(FizzBuzzAlgebra[Counter[str]]):
+    def __init__(self, rule: "VisitableRule") -> None:
+        self._rule = rule
+
+    def eval_number(self, n: "Number") -> Counter[str]:
+        label = self._rule(n)
+        return Counter({label if label is not None else "<number>": 1})
+
+    def emit_line(self, line: str) -> Counter[str]:
+        return Counter()
+
+    def tick(self, tag: str) -> Counter[str]:
+        return Counter({f"tick:{tag}": 1})
+
+    def sequence(self, items: list[Counter[str]]) -> Counter[str]:
+        result: Counter[str] = Counter()
+        for c in items:
+            result.update(c)
+        return result
+
+
+class _PrettyPrintAlgebra(FizzBuzzAlgebra[str]):
+    def __init__(self, indent: int = 0) -> None:
+        self._pad = "  " * indent
+
+    def eval_number(self, n: "Number") -> str:
+        return f"{self._pad}eval({n.value})"
+
+    def emit_line(self, line: str) -> str:
+        return f"{self._pad}emit({line!r})"
+
+    def tick(self, tag: str) -> str:
+        return f"{self._pad}tick({tag!r})"
+
+    def sequence(self, items: list[str]) -> str:
+        return "\n".join(items)
+
+
+class _TracingAlgebra(FizzBuzzAlgebra[Any]):
+    """Decorator algebra: wraps another algebra with lightweight span tracing."""
+    def __init__(self, inner: FizzBuzzAlgebra[Any], tracer: "Tracer") -> None:
+        self._inner = inner
+        self._tracer = tracer
+
+    def eval_number(self, n: "Number") -> Any:
+        with self._tracer.start_span(f"tagless.eval({n.value})"):
+            return self._inner.eval_number(n)
+
+    def emit_line(self, line: str) -> Any:
+        with self._tracer.start_span("tagless.emit"):
+            return self._inner.emit_line(line)
+
+    def tick(self, tag: str) -> Any:
+        return self._inner.tick(tag)
+
+    def sequence(self, items: list[Any]) -> Any:
+        return self._inner.sequence(items)
+
+
+def fizzbuzz_term(start: int, stop: int) -> FinalTerm:
+    """
+    Build a tagless-final term for FizzBuzz over [start, stop].
+
+    Pass any FizzBuzzAlgebra to execute:
+        lines = fizzbuzz_term(1, 15)(_CollectingAlgebra(rule))
+
+    `Number` is resolved at call-time (it lives in § 5, later in the module),
+    so the term itself is safe to construct at any point.
+    """
+    def _term(algebra: FizzBuzzAlgebra[Any]) -> Any:
+        items = [algebra.eval_number(Number(i)) for i in range(start, stop + 1)]
+        return algebra.sequence(items)
+
+    return _term
+
+
+# ===========================================================================
 # § 3  Event bus
 # ===========================================================================
 
@@ -1522,6 +1673,123 @@ class AbstractRuleInterpreter:
             for note in subs:
                 lines.append(f"    ⚠ {note}")
         return "\n".join(lines)
+
+
+# ===========================================================================
+# § 7b  Attribute grammar  (synthesized & inherited attrs over rule trees)
+# ===========================================================================
+# Attribute grammars annotate a tree with *synthesized* (bottom-up) and
+# *inherited* (top-down) attributes.  A synthesized attribute of a node is
+# computed from its children; an inherited attribute is passed down from
+# the parent.
+#
+# We implement a two-pass evaluator over the rule tree:
+#   Pass 1 (bottom-up): compute SynthesizedAttrs at every node.
+#   Pass 2 (top-down):  compute InheritedAttrs using parent's inherited
+#                       attrs and siblings' synthesized attrs.
+#
+# SynthesizedAttrs per rule node:
+#   depth       — max depth of sub-tree
+#   leaf_count  — number of leaf rules
+#   divisors    — frozenset of all divisors used
+#   labels      — frozenset of all labels that can be emitted
+#
+# InheritedAttrs per rule node:
+#   depth_from_root  — distance from tree root
+#   sibling_count    — number of siblings in parent composite
+#   rule_index       — index within parent composite (0-based)
+
+@dataclasses.dataclass(frozen=True)
+class SynthesizedAttrs:
+    depth: int
+    leaf_count: int
+    divisors: frozenset[int]
+    labels: frozenset[str]
+
+
+@dataclasses.dataclass(frozen=True)
+class InheritedAttrs:
+    depth_from_root: int
+    sibling_count: int
+    rule_index: int
+
+
+@dataclasses.dataclass
+class AttributedNode:
+    rule: "VisitableRule"
+    synth: SynthesizedAttrs
+    inh: InheritedAttrs
+    children: list["AttributedNode"] = dataclasses.field(default_factory=list)
+
+    def pretty(self, indent: int = 0) -> str:
+        pad = "  " * indent
+        lines = [
+            f"{pad}{self.rule!r}",
+            f"{pad}  synth: depth={self.synth.depth} leaves={self.synth.leaf_count}"
+            f" divisors={set(self.synth.divisors)} labels={set(self.synth.labels)}",
+            f"{pad}  inh:   depth_from_root={self.inh.depth_from_root}"
+            f" sibling_count={self.inh.sibling_count} index={self.inh.rule_index}",
+        ]
+        for child in self.children:
+            lines.append(child.pretty(indent + 1))
+        return "\n".join(lines)
+
+
+def _synthesize(rule: "VisitableRule") -> tuple[SynthesizedAttrs, list["VisitableRule"]]:
+    """Compute SynthesizedAttrs bottom-up for a single rule node."""
+    if isinstance(rule, CompositeRule):
+        child_attrs = [_synthesize(r) for r in rule.rules]
+        if not child_attrs:
+            return SynthesizedAttrs(depth=1, leaf_count=0, divisors=frozenset(), labels=frozenset()), []
+        max_depth = max(a.depth for a, _ in child_attrs)
+        total_leaves = sum(a.leaf_count for a, _ in child_attrs)
+        all_divisors: frozenset[int] = frozenset().union(*(a.divisors for a, _ in child_attrs))
+        all_labels: frozenset[str] = frozenset().union(*(a.labels for a, _ in child_attrs))
+        return SynthesizedAttrs(
+            depth=max_depth + 1,
+            leaf_count=total_leaves,
+            divisors=all_divisors,
+            labels=all_labels,
+        ), list(rule.rules)
+    elif isinstance(rule, DivisibilityRule):
+        return SynthesizedAttrs(
+            depth=1,
+            leaf_count=1,
+            divisors=frozenset({rule.divisor}),
+            labels=frozenset({rule.label}) if rule.label else frozenset(),
+        ), []
+    else:
+        # PredicateRule or unknown leaf
+        lbl = getattr(rule, "label", None)
+        return SynthesizedAttrs(
+            depth=1,
+            leaf_count=1,
+            divisors=frozenset(),
+            labels=frozenset({lbl}) if lbl else frozenset(),
+        ), []
+
+
+def _build_attributed_tree(
+    rule: "VisitableRule",
+    inh: InheritedAttrs,
+) -> AttributedNode:
+    """Recursively build AttributedNode with both synthesized and inherited attrs."""
+    synth, raw_children = _synthesize(rule)
+    node = AttributedNode(rule=rule, synth=synth, inh=inh)
+    for idx, child in enumerate(raw_children):
+        child_inh = InheritedAttrs(
+            depth_from_root=inh.depth_from_root + 1,
+            sibling_count=len(raw_children),
+            rule_index=idx,
+        )
+        node.children.append(_build_attributed_tree(child, child_inh))
+    return node
+
+
+def attribute_rule_tree(rule: "VisitableRule") -> AttributedNode:
+    """Entry point: annotate an entire rule tree with attributes."""
+    root_inh = InheritedAttrs(depth_from_root=0, sibling_count=1, rule_index=0)
+    return _build_attributed_tree(rule, root_inh)
 
 
 # ===========================================================================
@@ -2635,6 +2903,281 @@ def zip_rule(rule: CompositeRule) -> RuleZipper:
 
 
 # ===========================================================================
+# § 13d  Transducers  (composable, source-independent reducing transforms)
+# ===========================================================================
+# A *reducer* has type   (acc, item) -> acc.
+# A *transducer* is a higher-order function   (reducer) -> reducer.
+# Because transducers transform reducers—not values—they compose with plain
+# function composition and work identically over lists, generators, Observables,
+# channels, or any other iterable/push source.
+#
+# Primitives:
+#   mapping(f)           map f over items
+#   filtering(pred)      drop items where pred is False
+#   taking(n)            pass only the first n items
+#   dropping(n)          skip the first n items
+#   flat_mapping(f)      expand each item to zero or more sub-items
+#   deduplicating()      drop consecutive duplicate items
+#   windowing(size)      emit sliding windows as tuples
+#   labelling(rule)      FizzBuzz-specific: Number → (Number, LabelT)
+#   categorising()       attach NumberCategory flag to each Number
+#
+# compose_xf(*xfs)       left-to-right composition (first xf applied first)
+# transduce(xf, rf, init, iterable)  drive the transducer over an iterable
+# into(xf, iterable)     shorthand: collect into list
+
+_Acc = TypeVar("_Acc")
+_In  = TypeVar("_In")
+_Out = TypeVar("_Out")
+
+Reducer: TypeAlias = Callable[[Any, Any], Any]
+Transducer: TypeAlias = Callable[[Reducer], Reducer]
+
+
+def mapping(f: Callable[[Any], Any]) -> Transducer:
+    def _xf(rf: Reducer) -> Reducer:
+        def _step(acc: Any, item: Any) -> Any:
+            return rf(acc, f(item))
+        return _step
+    return _xf
+
+
+def filtering(pred: Callable[[Any], bool]) -> Transducer:
+    def _xf(rf: Reducer) -> Reducer:
+        def _step(acc: Any, item: Any) -> Any:
+            return rf(acc, item) if pred(item) else acc
+        return _step
+    return _xf
+
+
+def taking(n: int) -> Transducer:
+    def _xf(rf: Reducer) -> Reducer:
+        _count = [0]
+        def _step(acc: Any, item: Any) -> Any:
+            if _count[0] >= n:
+                return acc
+            _count[0] += 1
+            return rf(acc, item)
+        return _step
+    return _xf
+
+
+def dropping(n: int) -> Transducer:
+    def _xf(rf: Reducer) -> Reducer:
+        _dropped = [0]
+        def _step(acc: Any, item: Any) -> Any:
+            if _dropped[0] < n:
+                _dropped[0] += 1
+                return acc
+            return rf(acc, item)
+        return _step
+    return _xf
+
+
+def flat_mapping(f: Callable[[Any], Iterable[Any]]) -> Transducer:
+    def _xf(rf: Reducer) -> Reducer:
+        def _step(acc: Any, item: Any) -> Any:
+            for sub in f(item):
+                acc = rf(acc, sub)
+            return acc
+        return _step
+    return _xf
+
+
+def deduplicating() -> Transducer:
+    _UNSET = object()
+    def _xf(rf: Reducer) -> Reducer:
+        _prev = [_UNSET]
+        def _step(acc: Any, item: Any) -> Any:
+            if item == _prev[0]:
+                return acc
+            _prev[0] = item
+            return rf(acc, item)
+        return _step
+    return _xf
+
+
+def windowing(size: int) -> Transducer:
+    """Emit sliding windows of `size` as tuples."""
+    def _xf(rf: Reducer) -> Reducer:
+        _buf: list[Any] = []
+        def _step(acc: Any, item: Any) -> Any:
+            _buf.append(item)
+            if len(_buf) > size:
+                _buf.pop(0)
+            if len(_buf) == size:
+                return rf(acc, tuple(_buf))
+            return acc
+        return _step
+    return _xf
+
+
+def labelling(rule: "VisitableRule") -> Transducer:
+    """FizzBuzz transducer: Number → (Number, LabelT)."""
+    return mapping(lambda n: (n, rule(n)))
+
+
+def categorising() -> Transducer:
+    """Attach NumberCategory to each Number: Number → (Number, NumberCategory)."""
+    def _categorise(n: "Number") -> tuple["Number", "NumberCategory"]:
+        cat = NumberCategory.NONE
+        if n.value % 3 == 0:
+            cat |= NumberCategory.FIZZ
+        if n.value % 5 == 0:
+            cat |= NumberCategory.BUZZ
+        if n.is_prime:
+            cat |= NumberCategory.PRIME
+        if n.is_perfect:
+            cat |= NumberCategory.PERFECT
+        return (n, cat)
+    return mapping(_categorise)
+
+
+def compose_xf(*xfs: Transducer) -> Transducer:
+    """Compose transducers left-to-right (first argument is applied first)."""
+    def _composed(rf: Reducer) -> Reducer:
+        result = rf
+        for xf in reversed(xfs):
+            result = xf(result)
+        return result
+    return _composed
+
+
+def transduce(
+    xf: Transducer,
+    rf: Reducer,
+    init: Any,
+    iterable: Iterable[Any],
+) -> Any:
+    """Run transducer xf with reducing function rf over iterable, starting from init."""
+    step = xf(rf)
+    acc = init
+    for item in iterable:
+        acc = step(acc, item)
+    return acc
+
+
+def into(xf: Transducer, iterable: Iterable[Any]) -> list[Any]:
+    """Collect transduced items into a list."""
+    return transduce(xf, lambda acc, x: [*acc, x], [], iterable)
+
+
+# ===========================================================================
+# § 13e  Store comonad  (context-sensitive, position-indexed computation)
+# ===========================================================================
+# The Store comonad Store[S, A] = (S → A, S) models a "spreadsheet":
+# every cell position S has a computed value A, and a *cursor* tracks the
+# current focus.
+#
+#   store.extract()           value at the current cursor
+#   store.seek(s)             move cursor to s (returns new Store)
+#   store.peek(s)             read value at s without moving cursor
+#   store.map(f)              f applied pointwise to all positions
+#   store.extend(f)           cobind: new store where pos s holds f(seek(s))
+#   store.experiment(f)       f(cursor) → [positions] → [values]
+#   store.coflatten()         duplicate: each position holds Store focused there
+#
+# FizzBuzz application: Store[int, LabelT] lets each position inspect its
+# neighbours.  `fizzbuzz_context_labels` uses `extend` to annotate each
+# number with whether its predecessor and successor are also labelled.
+
+S = TypeVar("S")
+
+
+@dataclasses.dataclass(frozen=True)
+class Store(Generic[S, T_co]):
+    """Store comonad: an infinite position-indexed store of lazily computed values."""
+    _fn: Callable[[Any], Any]   # S → T
+    _cursor: Any                # S
+
+    @property
+    def cursor(self) -> Any:
+        return self._cursor
+
+    def extract(self) -> Any:
+        return self._fn(self._cursor)
+
+    def seek(self, s: Any) -> "Store[Any, Any]":
+        return Store(self._fn, s)
+
+    def peek(self, s: Any) -> Any:
+        return self._fn(s)
+
+    def map(self, f: Callable[[Any], Any]) -> "Store[Any, Any]":
+        return Store(lambda s: f(self._fn(s)), self._cursor)
+
+    def extend(self, f: Callable[["Store[Any, Any]"], Any]) -> "Store[Any, Any]":
+        """Cobind: each position s becomes f(store focused at s)."""
+        return Store(lambda s: f(self.seek(s)), self._cursor)
+
+    def coflatten(self) -> "Store[Any, Store[Any, Any]]":
+        return Store(lambda s: self.seek(s), self._cursor)
+
+    def experiment(self, f: Callable[[Any], list[Any]]) -> list[Any]:
+        """Read values at all positions returned by f(cursor)."""
+        return [self._fn(s) for s in f(self._cursor)]
+
+
+def make_fizzbuzz_store(
+    rule: "VisitableRule",
+    start: int = 1,
+    stop: int = 100,
+) -> Store[int, LabelT]:
+    """
+    Build a Store[int, LabelT] covering [start, stop].
+    Positions outside that range return None.
+    """
+    def _fn(n: int) -> LabelT:
+        if start <= n <= stop:
+            return rule(Number(n))
+        return None
+    return Store(_fn, start)
+
+
+@dataclasses.dataclass(frozen=True)
+class ContextualLabel:
+    position: int
+    label: LabelT
+    prev_label: LabelT
+    next_label: LabelT
+
+    @property
+    def is_isolated(self) -> bool:
+        """True if neither neighbour carries a label."""
+        return self.prev_label is None and self.next_label is None
+
+    @property
+    def is_run(self) -> bool:
+        """True if this and at least one neighbour share the same label."""
+        return (self.label is not None and
+                (self.label == self.prev_label or self.label == self.next_label))
+
+
+def fizzbuzz_context_labels(
+    rule: "VisitableRule",
+    start: int = 1,
+    stop: int = 20,
+) -> list[ContextualLabel]:
+    """
+    Use Store.extend to annotate each position with its neighbours' labels.
+    Demonstrates context-sensitivity via comonad cobind.
+    """
+    store: Store[int, LabelT] = make_fizzbuzz_store(rule, start, stop)
+
+    def _with_context(s: Store[int, LabelT]) -> ContextualLabel:
+        pos = s.cursor
+        return ContextualLabel(
+            position=pos,
+            label=s.extract(),
+            prev_label=s.peek(pos - 1),
+            next_label=s.peek(pos + 1),
+        )
+
+    extended: Store[int, ContextualLabel] = store.extend(_with_context)
+    return [extended.peek(n) for n in range(start, stop + 1)]
+
+
+# ===========================================================================
 # § 14  Pipeline state machine
 # ===========================================================================
 
@@ -3388,6 +3931,188 @@ def build_fizzbuzz_datalog(start: int = 1, stop: int = 50) -> DatalogEngine:
 
 
 # ===========================================================================
+# § 19d  Coroutine-based algebraic effect system
+# ===========================================================================
+# Effects are first-class *values* yielded by a generator.  A separate
+# *handler* drives the generator, intercepts each yielded effect, performs
+# the actual side-effect (IO, state mutation, …), and sends the result
+# back via `generator.send(result)`.
+#
+# This is structurally analogous to the free monad (§ 2d) but uses Python's
+# native generator protocol — no explicit AST, no continuation closures.
+#
+# Effect algebra:
+#   EvalEffect(n)          → LabelT      ask "what label does the rule give n?"
+#   EmitEffect(line)       → None        write one output line
+#   LogEffect(msg, level)  → None        write a log message
+#   AskEffect(key)         → Any         read a config / environment key
+#   StateGetEffect()       → dict        read mutable handler state
+#   StatePutEffect(state)  → None        write mutable handler state
+#
+# Handlers:
+#   handle_io(prog, rule, sink, env)  — full IO handler (default)
+#   handle_pure(prog, rule, env)      — pure/collecting (returns list[str])
+#   handle_counting(prog, rule)       — count labels, return Counter[str]
+
+@dataclasses.dataclass(frozen=True)
+class EvalEffect:
+    n: "Number"
+
+@dataclasses.dataclass(frozen=True)
+class EmitEffect:
+    line: str
+
+@dataclasses.dataclass(frozen=True)
+class LogEffect:
+    msg: str
+    level: int = logging.DEBUG
+
+@dataclasses.dataclass(frozen=True)
+class AskEffect:
+    key: str
+
+@dataclasses.dataclass(frozen=True)
+class StateGetEffect:
+    pass
+
+@dataclasses.dataclass(frozen=True)
+class StatePutEffect:
+    state: dict[str, Any]
+
+
+Effect: TypeAlias = EvalEffect | EmitEffect | LogEffect | AskEffect | StateGetEffect | StatePutEffect
+EffectProgram: TypeAlias = Generator[Effect, Any, Any]
+
+
+def fizzbuzz_effect_program(
+    numbers: Iterable["Number"],
+) -> Generator[Effect, Any, list[str]]:
+    """
+    Coroutine-based FizzBuzz computation expressed as a sequence of effects.
+    Yield an EvalEffect for each number; the handler sends back the label.
+    """
+    results: list[str] = []
+    state: dict[str, Any] = (yield StateGetEffect()) or {}
+
+    for n in numbers:
+        label: LabelT = yield EvalEffect(n)
+        line = label if label is not None else str(n.value)
+        yield EmitEffect(line)
+        yield LogEffect(f"emitted {line!r} for n={n.value}", logging.DEBUG)
+        results.append(line)
+        state["last_n"] = n.value
+        yield StatePutEffect(state)
+
+    yield LogEffect(f"done — {len(results)} lines emitted", logging.INFO)
+    return results
+
+
+def handle_io(
+    prog: EffectProgram,
+    rule: "VisitableRule",
+    sink: "OutputSink",
+    env: dict[str, Any] | None = None,
+) -> Any:
+    """IO handler: drives the effect program with real side-effects."""
+    _env = env or {}
+    _state: dict[str, Any] = {}
+    _eff_log = logging.getLogger("fizzbuzz.effects")
+    result = None
+    sent: Any = None
+    try:
+        eff = prog.send(None)  # start
+        while True:
+            match eff:
+                case EvalEffect(n=n):
+                    sent = rule(n)
+                case EmitEffect(line=line):
+                    sink.write(line)
+                    sent = None
+                case LogEffect(msg=msg, level=lvl):
+                    _eff_log.log(lvl, "%s", msg)
+                    sent = None
+                case AskEffect(key=key):
+                    sent = _env.get(key)
+                case StateGetEffect():
+                    sent = dict(_state)
+                case StatePutEffect(state=new_state):
+                    _state.update(new_state)
+                    sent = None
+                case _:
+                    sent = None
+            eff = prog.send(sent)
+    except StopIteration as exc:
+        result = exc.value
+    return result
+
+
+def handle_pure(
+    prog: EffectProgram,
+    rule: "VisitableRule",
+    env: dict[str, Any] | None = None,
+) -> list[str]:
+    """Pure handler: collects emitted lines without any IO."""
+    _env = env or {}
+    _state: dict[str, Any] = {}
+    lines: list[str] = []
+    sent: Any = None
+    try:
+        eff = prog.send(None)
+        while True:
+            match eff:
+                case EvalEffect(n=n):
+                    sent = rule(n)
+                case EmitEffect(line=line):
+                    lines.append(line)
+                    sent = None
+                case LogEffect():
+                    sent = None
+                case AskEffect(key=key):
+                    sent = _env.get(key)
+                case StateGetEffect():
+                    sent = dict(_state)
+                case StatePutEffect(state=new_state):
+                    _state.update(new_state)
+                    sent = None
+                case _:
+                    sent = None
+            eff = prog.send(sent)
+    except StopIteration:
+        pass
+    return lines
+
+
+def handle_counting(
+    prog: EffectProgram,
+    rule: "VisitableRule",
+) -> Counter[str]:
+    """Counting handler: tallies label frequencies, discards all IO."""
+    _state: dict[str, Any] = {}
+    counts: Counter[str] = Counter()
+    sent: Any = None
+    try:
+        eff = prog.send(None)
+        while True:
+            match eff:
+                case EvalEffect(n=n):
+                    label = rule(n)
+                    sent = label
+                    counts[label if label is not None else "<number>"] += 1
+                case EmitEffect() | LogEffect() | StatePutEffect():
+                    sent = None
+                case StateGetEffect():
+                    sent = dict(_state)
+                case AskEffect():
+                    sent = None
+                case _:
+                    sent = None
+            eff = prog.send(sent)
+    except StopIteration:
+        pass
+    return counts
+
+
+# ===========================================================================
 # § 20  Interactive REPL
 # ===========================================================================
 
@@ -3660,6 +4385,76 @@ def run_repl() -> None:
                     print(f"  {line}")
                 print(f"  Spans recorded: {len(_global_tracer._spans)}")
 
+            case "tagless":
+                alg_name = parts[1] if len(parts) > 1 else "collect"
+                rule = RuleRegistry().get(state["rule"])
+                term = fizzbuzz_term(state["start"], state["stop"])
+                match alg_name:
+                    case "collect":
+                        lines = term(_CollectingAlgebra(rule))
+                        for ln in lines[:20]:
+                            print(f"  {ln}")
+                        if len(lines) > 20:
+                            print(f"  … ({len(lines) - 20} more)")
+                    case "count":
+                        counts = term(_CountingAlgebra(rule))
+                        for lbl, cnt in counts.most_common():
+                            print(f"  {lbl:<16} {cnt}")
+                    case "pretty":
+                        print(term(_PrettyPrintAlgebra(indent=1)))
+                    case "print":
+                        term(_PrintingAlgebra(rule, StdoutSink()))
+                    case _:
+                        print("Usage: tagless [collect|count|pretty|print]")
+
+            case "transduce":
+                rule = RuleRegistry().get(state["rule"])
+                rng = list(NumberRange(state["start"], state["stop"]))
+                xf = compose_xf(
+                    labelling(rule),
+                    filtering(lambda pair: pair[1] is not None),
+                    mapping(lambda pair: f"{pair[0].value}={pair[1]}"),
+                )
+                result_lines = into(xf, rng)
+                for ln in result_lines:
+                    print(f"  {ln}")
+                print(f"  ({len(result_lines)} labelled out of {len(rng)})")
+
+            case "store":
+                rule = RuleRegistry().get(state["rule"])
+                ctx_labels = fizzbuzz_context_labels(
+                    rule, state["start"], min(state["stop"], state["start"] + 19)
+                )
+                for cl in ctx_labels:
+                    marker = "▶" if cl.is_run else ("·" if cl.is_isolated else " ")
+                    print(f"  {marker} {cl.position:>3}  label={cl.label or '':<8}"
+                          f"  prev={cl.prev_label or '':<8}  next={cl.next_label or '':<8}")
+
+            case "attrs":
+                rule = RuleRegistry().get(state["rule"])
+                tree = attribute_rule_tree(rule)
+                print(tree.pretty())
+
+            case "effects":
+                handler_name = parts[1] if len(parts) > 1 else "pure"
+                rule = RuleRegistry().get(state["rule"])
+                numbers = list(NumberRange(state["start"], state["stop"]))
+                match handler_name:
+                    case "pure":
+                        lines = handle_pure(fizzbuzz_effect_program(numbers), rule)
+                        for ln in lines[:20]:
+                            print(f"  {ln}")
+                        if len(lines) > 20:
+                            print(f"  … ({len(lines) - 20} more)")
+                    case "count":
+                        counts = handle_counting(fizzbuzz_effect_program(numbers), rule)
+                        for lbl, cnt in counts.most_common():
+                            print(f"  {lbl:<16} {cnt}")
+                    case "io":
+                        handle_io(fizzbuzz_effect_program(numbers), rule, StdoutSink())
+                    case _:
+                        print("Usage: effects [pure|count|io]")
+
             case "help":
                 print(
                     "  run / go                     — execute with current settings\n"
@@ -3683,6 +4478,11 @@ def run_repl() -> None:
                     "  zipper                       — navigate rule tree with zipper\n"
                     "  lens                         — demonstrate optics on rule structure\n"
                     "  datalog [pred]               — Datalog forward-chaining inference\n"
+                    "  tagless [collect|count|pretty|print]  — tagless final algebra\n"
+                    "  transduce                    — composable transducer pipeline\n"
+                    "  store                        — Store comonad context labels\n"
+                    "  attrs                        — attribute grammar tree annotation\n"
+                    "  effects [pure|count|io]      — coroutine effect system\n"
                     "  quit / exit                  — exit REPL\n"
                 )
             case _:
@@ -3815,6 +4615,39 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
     rw_p = sub.add_parser("rewrite", help="Algebraically simplify a Spec expression")
     rw_p.add_argument("expr", nargs="+")
 
+    # ── tagless ───────────────────────────────────────────────────────────────
+    tl_p = sub.add_parser("tagless", help="Run via tagless final algebra")
+    tl_p.add_argument("--start",   type=int, default=1)
+    tl_p.add_argument("--stop",    type=int, default=20)
+    tl_p.add_argument("--rule",    default="classic")
+    tl_p.add_argument("--algebra", choices=["collect", "count", "pretty", "print", "trace"],
+                      default="collect")
+
+    # ── transduce ─────────────────────────────────────────────────────────────
+    xf_p = sub.add_parser("transduce", help="Run via composable transducer pipeline")
+    xf_p.add_argument("--start",  type=int, default=1)
+    xf_p.add_argument("--stop",   type=int, default=100)
+    xf_p.add_argument("--rule",   default="classic")
+    xf_p.add_argument("--window", type=int, default=0, metavar="N",
+                      help="If >0, emit sliding windows of size N")
+
+    # ── store ─────────────────────────────────────────────────────────────────
+    st_p = sub.add_parser("store", help="Store comonad context-sensitive labelling")
+    st_p.add_argument("--start", type=int, default=1)
+    st_p.add_argument("--stop",  type=int, default=30)
+    st_p.add_argument("--rule",  default="classic")
+
+    # ── attrs ─────────────────────────────────────────────────────────────────
+    at_p = sub.add_parser("attrs", help="Attribute grammar tree annotation")
+    at_p.add_argument("--rule", default="classic")
+
+    # ── effects ───────────────────────────────────────────────────────────────
+    ef_p = sub.add_parser("effects", help="Coroutine-based algebraic effect system")
+    ef_p.add_argument("--start",   type=int, default=1)
+    ef_p.add_argument("--stop",    type=int, default=20)
+    ef_p.add_argument("--rule",    default="classic")
+    ef_p.add_argument("--handler", choices=["pure", "count", "io"], default="pure")
+
     args = parser.parse_args(argv)
     cmd = args.cmd or "run"
 
@@ -3945,6 +4778,91 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
             except Exception as exc:
                 print(f"Error: {exc}", file=sys.stderr)
                 return 1
+
+        case "tagless":
+            rule = RuleRegistry().get(args.rule)
+            term = fizzbuzz_term(args.start, args.stop)
+            match args.algebra:
+                case "collect":
+                    lines = term(_CollectingAlgebra(rule))
+                    for ln in lines:
+                        print(ln)
+                case "count":
+                    counts = term(_CountingAlgebra(rule))
+                    for lbl, cnt in counts.most_common():
+                        print(f"  {lbl:<16} {cnt}")
+                case "pretty":
+                    print(term(_PrettyPrintAlgebra(indent=0)))
+                case "print":
+                    term(_PrintingAlgebra(rule, StdoutSink()))
+                case "trace":
+                    inner = _CollectingAlgebra(rule)
+                    lines = term(_TracingAlgebra(inner, _global_tracer))
+                    for ln in lines:
+                        print(ln)
+                    print(_global_tracer.dump(), file=sys.stderr)
+
+        case "transduce":
+            rule = RuleRegistry().get(args.rule)
+            rng = list(NumberRange(args.start, args.stop))
+            if args.window > 0:
+                xf = compose_xf(
+                    labelling(rule),
+                    mapping(lambda pair: f"{pair[0].value}={pair[1] or str(pair[0].value)}"),
+                    windowing(args.window),
+                    mapping(lambda w: " | ".join(w)),
+                )
+            else:
+                xf = compose_xf(
+                    categorising(),
+                    mapping(lambda t: (t[0], t[1], rule(t[0]))),
+                    mapping(lambda t: f"{t[0].value:>4}  [{t[1].name:<10}]  {t[2] or str(t[0].value)}"),
+                )
+            results = into(xf, rng)
+            for ln in results:
+                print(ln)
+            print(f"\n{len(results)} items out of {len(rng)} input", file=sys.stderr)
+
+        case "store":
+            rule = RuleRegistry().get(args.rule)
+            ctx_labels = fizzbuzz_context_labels(rule, args.start, args.stop)
+            print(f"{'n':>4}  {'label':<10}  {'prev':<10}  {'next':<10}  notes")
+            print("─" * 52)
+            for cl in ctx_labels:
+                notes = []
+                if cl.is_run:
+                    notes.append("run")
+                if cl.is_isolated:
+                    notes.append("isolated")
+                lbl = cl.label or ""
+                prev = cl.prev_label or ""
+                nxt = cl.next_label or ""
+                print(f"{cl.position:>4}  {lbl:<10}  {prev:<10}  {nxt:<10}  {', '.join(notes)}")
+
+        case "attrs":
+            rule = RuleRegistry().get(args.rule)
+            tree = attribute_rule_tree(rule)
+            print(tree.pretty())
+            s = tree.synth
+            print(f"\nRoot synthesized attrs:")
+            print(f"  depth={s.depth}, leaf_count={s.leaf_count}")
+            print(f"  divisors={set(s.divisors)}, labels={set(s.labels)}")
+
+        case "effects":
+            rule = RuleRegistry().get(args.rule)
+            numbers = list(NumberRange(args.start, args.stop))
+            match args.handler:
+                case "pure":
+                    lines = handle_pure(fizzbuzz_effect_program(numbers), rule)
+                    for ln in lines:
+                        print(ln)
+                    print(f"\n{len(lines)} lines via pure effect handler", file=sys.stderr)
+                case "count":
+                    counts = handle_counting(fizzbuzz_effect_program(numbers), rule)
+                    for lbl, cnt in counts.most_common():
+                        print(f"  {lbl:<16} {cnt}")
+                case "io":
+                    handle_io(fizzbuzz_effect_program(numbers), rule, StdoutSink())
 
         case "run":
             _mw_map: dict[str, Middleware] = {
