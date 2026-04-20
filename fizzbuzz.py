@@ -574,6 +574,207 @@ def evaluate_in_env(number: Number) -> Reader[FizzBuzzEnv, Writer[str]]:
 
 
 # ===========================================================================
+# § 2d  Free monad over the FizzBuzz instruction algebra
+# ===========================================================================
+# Encode a FizzBuzz computation as a *data structure* (an AST), then run it
+# through swappable interpreters: IO, pure/collecting, traced, or mocked.
+#
+# The instruction algebra has three opcodes:
+#   InstrEval  — ask "what label does rule give this number?"
+#   InstrEmit  — output a line of text
+#   InstrTick  — increment a named counter
+#
+# Each opcode carries a continuation slot `k` (its "hole"), which the
+# interpreter fills with the opcode's response, producing the next step.
+# FBSuspend.flat_map distributes into the continuation, giving us the
+# monad without needing higher-kinded types.
+
+class FizzBuzzInstr(abc.ABC, Generic[T]):
+    """A single FizzBuzz instruction; T is the type of the continuation."""
+    @abc.abstractmethod
+    def fmap(self, f: Callable[[T], U]) -> FizzBuzzInstr[U]: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class InstrEval(FizzBuzzInstr[T]):
+    number: Number
+    k: Callable[[LabelT], T]
+    def fmap(self, f: Callable[[T], U]) -> InstrEval[U]:
+        return InstrEval(self.number, lambda lbl: f(self.k(lbl)))
+
+
+@dataclasses.dataclass(frozen=True)
+class InstrEmit(FizzBuzzInstr[T]):
+    line: str
+    k: Callable[[None], T]
+    def fmap(self, f: Callable[[T], U]) -> InstrEmit[U]:
+        return InstrEmit(self.line, lambda _: f(self.k(None)))
+
+
+@dataclasses.dataclass(frozen=True)
+class InstrTick(FizzBuzzInstr[T]):
+    counter: str
+    k: Callable[[None], T]
+    def fmap(self, f: Callable[[T], U]) -> InstrTick[U]:
+        return InstrTick(self.counter, lambda _: f(self.k(None)))
+
+
+class FBProgram(Generic[T]):
+    """Free monad over FizzBuzzInstr.  Values of this type are inert programs
+    (data) until fed to an interpreter."""
+
+    def map(self, f: Callable[[T], U]) -> FBProgram[U]:
+        return self.flat_map(lambda x: FBPure(f(x)))
+
+    def flat_map(self, f: Callable[[T], FBProgram[U]]) -> FBProgram[U]:
+        raise NotImplementedError
+
+    def __rshift__(self, other: FBProgram[U]) -> FBProgram[U]:
+        return self.flat_map(lambda _: other)
+
+
+@dataclasses.dataclass(frozen=True)
+class FBPure(FBProgram[T]):
+    value: T
+
+    def flat_map(self, f: Callable[[T], FBProgram[U]]) -> FBProgram[U]:
+        return f(self.value)
+
+
+@dataclasses.dataclass(frozen=True)
+class FBSuspend(FBProgram[T]):
+    instr: FizzBuzzInstr[FBProgram[T]]
+
+    def flat_map(self, f: Callable[[T], FBProgram[U]]) -> FBProgram[U]:
+        return FBSuspend(self.instr.fmap(lambda p: p.flat_map(f)))
+
+
+# ── Smart constructors ────────────────────────────────────────────────────────
+
+def fb_eval(n: Number) -> FBProgram[LabelT]:
+    return FBSuspend(InstrEval(n, k=FBPure))
+
+def fb_emit(line: str) -> FBProgram[None]:
+    return FBSuspend(InstrEmit(line, k=FBPure))
+
+def fb_tick(counter: str) -> FBProgram[None]:
+    return FBSuspend(InstrTick(counter, k=FBPure))
+
+def fb_for_each(numbers: Iterable[Number]) -> FBProgram[None]:
+    """Build a FizzBuzz program for an iterable of numbers using monadic bind."""
+    prog: FBProgram[None] = FBPure(None)
+    for n in reversed(list(numbers)):
+        _n = n
+        _rest = prog
+        def _step(num: Number = _n, rest: FBProgram[None] = _rest) -> FBProgram[None]:
+            return (
+                fb_eval(num)
+                .flat_map(lambda label:
+                    fb_emit(label if label is not None else str(num.value))
+                    >> fb_tick("labelled" if label else "unlabelled")
+                    >> rest
+                )
+            )
+        prog = _step()
+    return prog
+
+
+# ── Interpreters  ─────────────────────────────────────────────────────────────
+
+def fb_interpret_io(
+    prog: FBProgram[T],
+    rule: CompositeRule,
+    sink: OutputSink,
+) -> T:
+    """Trampolined IO interpreter — executes side-effects; O(1) stack depth."""
+    while True:
+        match prog:
+            case FBPure(value=val):
+                return val
+            case FBSuspend(instr=InstrEval(number=n, k=k)):
+                prog = k(rule(n))
+            case FBSuspend(instr=InstrEmit(line=line, k=k)):
+                sink.write(line)
+                prog = k(None)
+            case FBSuspend(instr=InstrTick(counter=_, k=k)):
+                prog = k(None)
+            case _:
+                raise RuntimeError(f"Unknown program node: {prog!r}")
+
+
+def fb_interpret_pure(
+    prog: FBProgram[T],
+    rule: CompositeRule,
+) -> tuple[T, list[str], dict[str, int]]:
+    """Pure interpreter — no side effects; returns (value, emitted_lines, counters)."""
+    lines: list[str] = []
+    counters: Counter[str] = Counter()
+    while True:
+        match prog:
+            case FBPure(value=val):
+                return val, lines, dict(counters)
+            case FBSuspend(instr=InstrEval(number=n, k=k)):
+                prog = k(rule(n))
+            case FBSuspend(instr=InstrEmit(line=line, k=k)):
+                lines.append(line)
+                prog = k(None)
+            case FBSuspend(instr=InstrTick(counter=c, k=k)):
+                counters[c] += 1
+                prog = k(None)
+            case _:
+                raise RuntimeError(f"Unknown program node: {prog!r}")
+
+
+def fb_interpret_traced(
+    prog: FBProgram[T],
+    rule: CompositeRule,
+    sink: OutputSink,
+    tracer: Tracer,
+) -> T:
+    """IO interpreter with per-instruction tracing via Tracer spans."""
+    steps = 0
+    while True:
+        steps += 1
+        match prog:
+            case FBPure(value=val):
+                log.debug("Free monad: %d steps, done.", steps)
+                return val
+            case FBSuspend(instr=InstrEval(number=n, k=k)):
+                with tracer.start_span("fb.eval", n=n.value):
+                    label = rule(n)
+                prog = k(label)
+            case FBSuspend(instr=InstrEmit(line=line, k=k)):
+                with tracer.start_span("fb.emit", line=line[:20]):
+                    sink.write(line)
+                prog = k(None)
+            case FBSuspend(instr=InstrTick(counter=c, k=k)):
+                prog = k(None)
+            case _:
+                raise RuntimeError(f"Unknown program node: {prog!r}")
+
+
+def fb_interpret_mock(
+    prog: FBProgram[T],
+    mock_labels: dict[int, LabelT],
+) -> tuple[T, list[str]]:
+    """Mock interpreter — uses a pre-supplied label map instead of a real rule."""
+    lines: list[str] = []
+    while True:
+        match prog:
+            case FBPure(value=val):
+                return val, lines
+            case FBSuspend(instr=InstrEval(number=n, k=k)):
+                prog = k(mock_labels.get(n.value))
+            case FBSuspend(instr=InstrEmit(line=line, k=k)):
+                lines.append(line)
+                prog = k(None)
+            case FBSuspend(instr=InstrTick(counter=_, k=k)):
+                prog = k(None)
+            case _:
+                raise RuntimeError(f"Unknown program node: {prog!r}")
+
+
+# ===========================================================================
 # § 3  Event bus
 # ===========================================================================
 
@@ -1491,6 +1692,151 @@ _global_rule_store = ContentAddressableRuleStore()
 
 
 # ===========================================================================
+# § 8c  Optics  (Lens + Prism + Traversal)
+# ===========================================================================
+# Lenses:   bidirectional getter/setter for a field inside a structure.
+# Prisms:   partial bidirectional iso for one branch of a sum type.
+# Traversal: zero-or-more focuses (like a Lens but over a collection).
+# All compose left-to-right with the @ operator.
+
+@dataclasses.dataclass(frozen=True)
+class Lens(Generic[T, U]):
+    """Lens[S, A] — focuses on a field of type A within structure S.
+
+    Compose with @: (lens_s_to_a @ lens_a_to_b) focuses from S all the way to B.
+    """
+    _get: Callable[[T], U]
+    _set: Callable[[T, U], T]
+
+    def get(self, s: T) -> U:
+        return self._get(s)
+
+    def set(self, s: T, a: U) -> T:
+        return self._set(s, a)
+
+    def modify(self, f: Callable[[U], U]) -> Callable[[T], T]:
+        return lambda s: self._set(s, f(self._get(s)))
+
+    def __matmul__(self, other: Lens[U, Any]) -> Lens[T, Any]:
+        """Lens composition:  self @ other  dives from T→U→..."""
+        return Lens(
+            _get=lambda s: other._get(self._get(s)),
+            _set=lambda s, b: self._set(s, other._set(self._get(s), b)),
+        )
+
+    @staticmethod
+    def identity() -> Lens[T, T]:
+        return Lens(_get=lambda s: s, _set=lambda _s, a: a)
+
+
+@dataclasses.dataclass(frozen=True)
+class Prism(Generic[T, U]):
+    """Prism[S, A] — focuses on one branch of a sum type.
+
+    preview: S → A | None   (None when not that branch)
+    review:  A → S          (inject into the sum type)
+    """
+    _preview: Callable[[T], U | None]
+    _review: Callable[[U], T]
+
+    def preview(self, s: T) -> U | None:
+        return self._preview(s)
+
+    def review(self, a: U) -> T:
+        return self._review(a)
+
+    def is_case(self, s: T) -> bool:
+        return self._preview(s) is not None
+
+    def modify(self, f: Callable[[U], U]) -> Callable[[T], T]:
+        def mod(s: T) -> T:
+            inner = self._preview(s)
+            return self._review(f(inner)) if inner is not None else s
+        return mod
+
+    def __matmul__(self, other: Prism[U, Any]) -> Prism[T, Any]:
+        return Prism(
+            _preview=lambda s: (
+                other._preview(inner) if (inner := self._preview(s)) is not None else None
+            ),
+            _review=lambda b: self._review(other._review(b)),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class Traversal(Generic[T, U]):
+    """Traversal[S, A] — focuses on zero-or-more A's inside S."""
+    _to_list: Callable[[T], list[U]]
+    _set_all: Callable[[T, list[U]], T]
+
+    def to_list(self, s: T) -> list[U]:
+        return self._to_list(s)
+
+    def modify_all(self, f: Callable[[U], U]) -> Callable[[T], T]:
+        def mod(s: T) -> T:
+            items = self._to_list(s)
+            return self._set_all(s, [f(x) for x in items])
+        return mod
+
+    def set_all(self, s: T, val: U) -> T:
+        items = self._to_list(s)
+        return self._set_all(s, [val] * len(items))
+
+    @staticmethod
+    def from_lens(lens: Lens[T, U]) -> Traversal[T, U]:
+        return Traversal(
+            _to_list=lambda s: [lens.get(s)],
+            _set_all=lambda s, xs: lens.set(s, xs[0]) if xs else s,
+        )
+
+
+# ── Domain-specific lenses and prisms ─────────────────────────────────────────
+
+number_value: Lens[Number, int] = Lens(
+    _get=lambda n: n.value,
+    _set=lambda _n, v: Number(v),
+)
+
+div_rule_divisor: Lens[DivisibilityRule, int] = Lens(
+    _get=lambda r: r.divisor,
+    _set=lambda r, d: DivisibilityRule(d, r.label),
+)
+
+div_rule_label: Lens[DivisibilityRule, str] = Lens(
+    _get=lambda r: r.label,
+    _set=lambda r, lbl: DivisibilityRule(r.divisor, lbl),
+)
+
+composite_rules: Lens[CompositeRule, tuple[VisitableRule, ...]] = Lens(
+    _get=lambda r: r.rules,
+    _set=lambda _r, rules: CompositeRule(rules),
+)
+
+composite_first_rule: Lens[CompositeRule, VisitableRule] = Lens(
+    _get=lambda r: r.rules[0],
+    _set=lambda r, rule: CompositeRule((rule,) + r.rules[1:]),
+)
+
+ok_prism: Prism[Any, Any] = Prism(
+    _preview=lambda r: r.value if isinstance(r, Ok) else None,
+    _review=Ok,
+)
+
+err_prism: Prism[Any, Any] = Prism(
+    _preview=lambda r: r.error if isinstance(r, Err) else None,
+    _review=Err,
+)
+
+divisibility_rules_traversal: Traversal[CompositeRule, DivisibilityRule] = Traversal(
+    _to_list=lambda r: [sub for sub in r.rules if isinstance(sub, DivisibilityRule)],
+    _set_all=lambda r, new_divs: CompositeRule(tuple(
+        new_divs.pop(0) if isinstance(sub, DivisibilityRule) else sub
+        for sub in r.rules
+    )),
+)
+
+
+# ===========================================================================
 # § 9  Formatter strategy  (strategy + decorator chain)
 # ===========================================================================
 
@@ -2153,6 +2499,142 @@ def fizzbuzz_observable(
 
 
 # ===========================================================================
+# § 13c  Rule tree zipper
+# ===========================================================================
+# A zipper provides a "cursor" into a tree with O(1) local edits.
+# Navigating up reconstructs parent nodes lazily from breadcrumb context.
+#
+# Structure: the zipper holds the *focus* (current node) plus a *crumb trail*
+# (stack of sibling contexts) that describes the path from the root.
+
+@dataclasses.dataclass(frozen=True)
+class ZipCrumb:
+    """One level of zipper context: siblings to the left and right of focus."""
+    left: tuple[VisitableRule, ...]   # siblings before focus (reversed: head=nearest)
+    right: tuple[VisitableRule, ...]  # siblings after focus
+
+
+@dataclasses.dataclass(frozen=True)
+class RuleZipper:
+    """A navigable cursor into a flat CompositeRule child list."""
+    focus: VisitableRule
+    crumbs: tuple[ZipCrumb, ...]
+
+    # ── navigation ───────────────────────────────────────────────────────────
+
+    def down(self, idx: int = 0) -> RuleZipper:
+        """Enter the focused CompositeRule at position `idx`."""
+        if not isinstance(self.focus, CompositeRule):
+            raise TypeError("focus is not a CompositeRule; cannot go down")
+        rules = self.focus.rules
+        if not rules:
+            raise IndexError("Empty composite rule")
+        idx = idx % len(rules)
+        return RuleZipper(
+            focus=rules[idx],
+            crumbs=self.crumbs + (ZipCrumb(rules[:idx][::-1], rules[idx + 1:]),),
+        )
+
+    def up(self) -> RuleZipper:
+        if not self.crumbs:
+            raise IndexError("Already at root")
+        crumb = self.crumbs[-1]
+        siblings = crumb.left[::-1] + (self.focus,) + crumb.right
+        return RuleZipper(focus=CompositeRule(siblings), crumbs=self.crumbs[:-1])
+
+    def right(self) -> RuleZipper:
+        if not self.crumbs:
+            raise IndexError("No context (at root)")
+        crumb = self.crumbs[-1]
+        if not crumb.right:
+            raise IndexError("No right sibling")
+        return RuleZipper(
+            focus=crumb.right[0],
+            crumbs=self.crumbs[:-1] + (ZipCrumb((self.focus,) + crumb.left, crumb.right[1:]),),
+        )
+
+    def left(self) -> RuleZipper:
+        if not self.crumbs:
+            raise IndexError("No context (at root)")
+        crumb = self.crumbs[-1]
+        if not crumb.left:
+            raise IndexError("No left sibling")
+        return RuleZipper(
+            focus=crumb.left[0],
+            crumbs=self.crumbs[:-1] + (ZipCrumb(crumb.left[1:], (self.focus,) + crumb.right),),
+        )
+
+    def top(self) -> RuleZipper:
+        z = self
+        while z.crumbs:
+            z = z.up()
+        return z
+
+    # ── edits ────────────────────────────────────────────────────────────────
+
+    def modify(self, f: Callable[[VisitableRule], VisitableRule]) -> RuleZipper:
+        return dataclasses.replace(self, focus=f(self.focus))
+
+    def replace(self, new_rule: VisitableRule) -> RuleZipper:
+        return dataclasses.replace(self, focus=new_rule)
+
+    def insert_right(self, rule: VisitableRule) -> RuleZipper:
+        if not self.crumbs:
+            raise IndexError("No context (at root)")
+        crumb = self.crumbs[-1]
+        return RuleZipper(
+            focus=self.focus,
+            crumbs=self.crumbs[:-1] + (ZipCrumb(crumb.left, (rule,) + crumb.right),),
+        )
+
+    def insert_left(self, rule: VisitableRule) -> RuleZipper:
+        if not self.crumbs:
+            raise IndexError("No context (at root)")
+        crumb = self.crumbs[-1]
+        return RuleZipper(
+            focus=self.focus,
+            crumbs=self.crumbs[:-1] + (ZipCrumb((rule,) + crumb.left, crumb.right),),
+        )
+
+    def delete(self) -> RuleZipper:
+        """Remove focus; move to right sibling, then left, then up."""
+        if not self.crumbs:
+            raise ValueError("Cannot delete root")
+        crumb = self.crumbs[-1]
+        if crumb.right:
+            return RuleZipper(
+                focus=crumb.right[0],
+                crumbs=self.crumbs[:-1] + (ZipCrumb(crumb.left, crumb.right[1:]),),
+            )
+        if crumb.left:
+            return RuleZipper(
+                focus=crumb.left[0],
+                crumbs=self.crumbs[:-1] + (ZipCrumb(crumb.left[1:], crumb.right),),
+            )
+        raise ValueError("Cannot delete the only rule in a composite")
+
+    # ── extraction ───────────────────────────────────────────────────────────
+
+    def root(self) -> CompositeRule:
+        """Navigate to top and return the reconstructed CompositeRule."""
+        z = self.top()
+        if isinstance(z.focus, CompositeRule):
+            return z.focus
+        return CompositeRule((z.focus,))
+
+    def path(self) -> list[str]:
+        return [f"depth={i} left={len(c.left)} right={len(c.right)}" for i, c in enumerate(self.crumbs)]
+
+    def __repr__(self) -> str:
+        return f"RuleZipper(focus={self.focus!r}, depth={len(self.crumbs)})"
+
+
+def zip_rule(rule: CompositeRule) -> RuleZipper:
+    """Construct a zipper positioned at the root (the composite itself)."""
+    return RuleZipper(focus=rule, crumbs=())
+
+
+# ===========================================================================
 # § 14  Pipeline state machine
 # ===========================================================================
 
@@ -2747,6 +3229,165 @@ def run_builtin_properties(trials: int = 200) -> dict[str, PropertyResult]:
 
 
 # ===========================================================================
+# § 19c  Datalog engine  (forward-chaining logic programming)
+# ===========================================================================
+# A miniature Datalog: assert ground facts, add Horn-clause rules, run
+# semi-naive forward chaining to fixpoint, then query with variable patterns.
+#
+# Variables are DatalogVar instances; constants are any other Python value.
+# Unification is structural equality on constants and substitution on vars.
+
+@dataclasses.dataclass(frozen=True)
+class DatalogVar:
+    name: str
+    def __repr__(self) -> str: return f"?{self.name}"
+
+
+@dataclasses.dataclass(frozen=True)
+class DatalogAtom:
+    predicate: str
+    args: tuple[Any, ...]
+    def __str__(self) -> str:
+        return f"{self.predicate}({', '.join(repr(a) for a in self.args)})"
+
+
+@dataclasses.dataclass(frozen=True)
+class DatalogClause:
+    """Horn clause:  head :- body[0], body[1], ..."""
+    head: DatalogAtom
+    body: tuple[DatalogAtom, ...]
+    def __str__(self) -> str:
+        body = ", ".join(map(str, self.body))
+        return f"{self.head} :- {body}" if self.body else str(self.head)
+
+
+Substitution: TypeAlias = dict[str, Any]
+
+
+def _unify_atom(pattern: DatalogAtom, fact: DatalogAtom, sub: Substitution) -> Substitution | None:
+    """Unify pattern against fact under current substitution; return extended sub or None."""
+    if pattern.predicate != fact.predicate or len(pattern.args) != len(fact.args):
+        return None
+    result = dict(sub)
+    for p_arg, f_arg in zip(pattern.args, fact.args):
+        if isinstance(p_arg, DatalogVar):
+            p_val = result.get(p_arg.name, _SENTINEL)
+            if p_val is _SENTINEL:
+                result[p_arg.name] = f_arg
+            elif p_val != f_arg:
+                return None
+        elif p_arg != f_arg:
+            return None
+    return result
+
+
+def _apply_sub(atom: DatalogAtom, sub: Substitution) -> DatalogAtom:
+    """Ground an atom by substituting all variables."""
+    new_args = tuple(
+        sub.get(a.name, a) if isinstance(a, DatalogVar) else a
+        for a in atom.args
+    )
+    return DatalogAtom(atom.predicate, new_args)
+
+
+class DatalogEngine:
+    """Semi-naive forward-chaining Datalog evaluator."""
+
+    def __init__(self) -> None:
+        self._facts: set[DatalogAtom] = set()
+        self._clauses: list[DatalogClause] = []
+        self._derived_count = 0
+        self._log = logging.getLogger("fizzbuzz.datalog")
+
+    def assert_fact(self, predicate: str, *args: Any) -> None:
+        self._facts.add(DatalogAtom(predicate, args))
+
+    def add_clause(self, head: DatalogAtom, *body: DatalogAtom) -> None:
+        self._clauses.append(DatalogClause(head, body))
+
+    def derive(self, max_rounds: int = 50) -> int:
+        """Semi-naive fixpoint iteration. Returns total new facts derived."""
+        new_total = 0
+        for round_n in range(max_rounds):
+            new_facts: set[DatalogAtom] = set()
+            for clause in self._clauses:
+                for sub in self._solve_body(clause.body, {}):
+                    grounded = _apply_sub(clause.head, sub)
+                    if grounded not in self._facts:
+                        new_facts.add(grounded)
+            if not new_facts:
+                self._log.debug("Fixpoint reached after %d rounds, %d new facts", round_n + 1, new_total)
+                break
+            self._facts |= new_facts
+            new_total += len(new_facts)
+        return new_total
+
+    def _solve_body(self, body: tuple[DatalogAtom, ...], sub: Substitution) -> Iterator[Substitution]:
+        if not body:
+            yield sub
+            return
+        first, *rest = body
+        for fact in self._facts:
+            new_sub = _unify_atom(first, fact, sub)
+            if new_sub is not None:
+                yield from self._solve_body(tuple(rest), new_sub)
+
+    def query(self, predicate: str, *args: Any) -> list[Substitution]:
+        """Return all substitutions that satisfy predicate(*args)."""
+        pattern = DatalogAtom(predicate, args)
+        return [
+            sub for fact in self._facts
+            if (sub := _unify_atom(pattern, fact, {})) is not None
+        ]
+
+    def facts(self, predicate: str) -> list[DatalogAtom]:
+        return sorted((f for f in self._facts if f.predicate == predicate), key=str)
+
+    def all_constants(self, predicate: str, pos: int = 0) -> list[Any]:
+        return sorted({f.args[pos] for f in self._facts if f.predicate == predicate})
+
+    def dump(self, predicate: str | None = None) -> str:
+        lines = []
+        preds = {f.predicate for f in self._facts} if predicate is None else {predicate}
+        for pred in sorted(preds):
+            for fact in self.facts(pred):
+                lines.append(f"  {fact}")
+        return "\n".join(lines)
+
+
+def build_fizzbuzz_datalog(start: int = 1, stop: int = 50) -> DatalogEngine:
+    """Populate a DatalogEngine with FizzBuzz facts and rules."""
+    engine = DatalogEngine()
+    N = DatalogVar("N")
+
+    for n in range(start, stop + 1):
+        for d in (2, 3, 5, 7, 11, 13):
+            if n % d == 0:
+                engine.assert_fact("divides", d, n)
+        if _is_prime(n):
+            engine.assert_fact("prime", n)
+        if _is_perfect(n):
+            engine.assert_fact("perfect", n)
+
+    # fizz(N)      :- divides(3, N)
+    # buzz(N)      :- divides(5, N)
+    # fizzbuzz(N)  :- fizz(N), buzz(N)
+    # prime_fizz(N):- fizz(N), prime(N)
+    # interesting(N):- prime(N)
+    # interesting(N):- perfect(N)
+    engine.add_clause(DatalogAtom("fizz",       (N,)), DatalogAtom("divides", (3, N)))
+    engine.add_clause(DatalogAtom("buzz",       (N,)), DatalogAtom("divides", (5, N)))
+    engine.add_clause(DatalogAtom("fizzbuzz",   (N,)), DatalogAtom("fizz", (N,)), DatalogAtom("buzz", (N,)))
+    engine.add_clause(DatalogAtom("prime_fizz", (N,)), DatalogAtom("fizz", (N,)), DatalogAtom("prime", (N,)))
+    engine.add_clause(DatalogAtom("interesting",(N,)), DatalogAtom("prime", (N,)))
+    engine.add_clause(DatalogAtom("interesting",(N,)), DatalogAtom("perfect", (N,)))
+
+    n_new = engine.derive()
+    log.debug("Datalog: derived %d new facts", n_new)
+    return engine
+
+
+# ===========================================================================
 # § 20  Interactive REPL
 # ===========================================================================
 
@@ -2954,6 +3595,71 @@ def run_repl() -> None:
                     for entry in log_lines:
                         print(f"    [{entry}]")
 
+            case "free":
+                rule = RuleRegistry().get(state["rule"])
+                numbers = list(NumberRange(state["start"], state["stop"]))
+                prog = fb_for_each(numbers)
+                _val, lines, counters = fb_interpret_pure(prog, rule)
+                for line in lines[:20]:
+                    print(f"  {line}")
+                if len(lines) > 20:
+                    print(f"  … ({len(lines) - 20} more)")
+                print(f"  Counters: {dict(counters)}")
+
+            case "zipper":
+                rule = RuleRegistry().get(state["rule"])
+                z = zip_rule(rule)
+                if isinstance(rule, CompositeRule) and rule.rules:
+                    z = z.down()
+                    print(f"  Root:  {rule!r}")
+                    print(f"  Focus: {z.focus!r}")
+                    print(f"  Path:  {z.path()}")
+                    if len(rule.rules) > 1:
+                        z2 = z.right()
+                        print(f"  Right: {z2.focus!r}")
+                    reconstructed = z.root()
+                    print(f"  Root (reconstructed): {reconstructed!r}")
+                    print(f"  Identical: {reconstructed.rules == rule.rules}")
+
+            case "lens":
+                rule = RuleRegistry().get(state["rule"])
+                print(f"  Rule: {rule!r}")
+                divs = divisibility_rules_traversal.to_list(rule)
+                if divs:
+                    print(f"  DivisibilityRules: {[str(d) for d in divs]}")
+                    doubled = divisibility_rules_traversal.modify_all(
+                        lambda r: div_rule_divisor.modify(lambda d: d)(r)
+                    )(rule)
+                    print(f"  Lens demo (first div label): {div_rule_label.get(divs[0])!r}")
+                    new_rule = composite_first_rule.modify(
+                        lambda r: div_rule_label.set(r, r.label.upper()) if isinstance(r, DivisibilityRule) else r
+                    )(rule)
+                    print(f"  After uppercasing first label: {composite_first_rule.get(new_rule)!r}")
+
+            case "datalog":
+                n_stop = min(state["stop"], 50)
+                engine = build_fizzbuzz_datalog(state["start"], n_stop)
+                fizzbuzz_ns = engine.all_constants("fizzbuzz", pos=0)
+                prime_ns    = engine.all_constants("prime", pos=0)
+                interesting = engine.all_constants("interesting", pos=0)
+                print(f"  FizzBuzz numbers: {fizzbuzz_ns}")
+                print(f"  Primes:           {prime_ns[:10]}{'…' if len(prime_ns) > 10 else ''}")
+                print(f"  Interesting:      {sorted(set(interesting))[:10]}")
+                if len(parts) > 1:
+                    pred = parts[1]
+                    vals = engine.all_constants(pred)
+                    print(f"  {pred}: {vals}")
+
+            case "free-traced":
+                rule = RuleRegistry().get(state["rule"])
+                numbers = list(NumberRange(state["start"], min(state["start"] + 9, state["stop"])))
+                prog = fb_for_each(numbers)
+                sink = BufferedSink()
+                fb_interpret_traced(prog, rule, sink, _global_tracer)
+                for line in sink.lines:
+                    print(f"  {line}")
+                print(f"  Spans recorded: {len(_global_tracer._spans)}")
+
             case "help":
                 print(
                     "  run / go                     — execute with current settings\n"
@@ -2972,6 +3678,11 @@ def run_repl() -> None:
                     "  proptest [N]                 — run built-in property tests\n"
                     "  reader                       — evaluate via Reader+Writer monads\n"
                     "  trace                        — dump tracing spans\n"
+                    "  free                         — run via free monad (pure interpreter)\n"
+                    "  free-traced                  — run via free monad (traced interpreter)\n"
+                    "  zipper                       — navigate rule tree with zipper\n"
+                    "  lens                         — demonstrate optics on rule structure\n"
+                    "  datalog [pred]               — Datalog forward-chaining inference\n"
                     "  quit / exit                  — exit REPL\n"
                 )
             case _:
@@ -3083,6 +3794,23 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
     pd_p = sub.add_parser("parse-dsl", help="Parse a rule DSL via parser combinators")
     pd_p.add_argument("spec", nargs="+")
 
+    # ── free ──────────────────────────────────────────────────────────────────
+    free_p = sub.add_parser("free", help="Run via free monad interpreter")
+    free_p.add_argument("--start",      type=int, default=1)
+    free_p.add_argument("--stop",       type=int, default=20)
+    free_p.add_argument("--rule",       default="classic")
+    free_p.add_argument("--interpreter", choices=["io", "pure", "traced", "mock"], default="pure")
+
+    # ── datalog ───────────────────────────────────────────────────────────────
+    dl_p = sub.add_parser("datalog", help="Datalog forward-chaining inference")
+    dl_p.add_argument("--start",     type=int, default=1)
+    dl_p.add_argument("--stop",      type=int, default=50)
+    dl_p.add_argument("--query",     default=None, help="Predicate to query (e.g. fizzbuzz)")
+
+    # ── zipper ────────────────────────────────────────────────────────────────
+    zp_p = sub.add_parser("zipper", help="Demonstrate rule tree zipper")
+    zp_p.add_argument("--rule", default="classic")
+
     # ── rewrite ───────────────────────────────────────────────────────────────
     rw_p = sub.add_parser("rewrite", help="Algebraically simplify a Spec expression")
     rw_p.add_argument("expr", nargs="+")
@@ -3147,6 +3875,58 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
             else:
                 print(f"Parse error: {result_p.error}", file=sys.stderr)
                 return 1
+
+        case "free":
+            rule = RuleRegistry().get(args.rule)
+            numbers = list(NumberRange(args.start, args.stop))
+            prog = fb_for_each(numbers)
+            if args.interpreter == "pure":
+                _val, lines, counters = fb_interpret_pure(prog, rule)
+                for line in lines:
+                    print(line)
+                print(f"\nCounters: {dict(counters)}", file=sys.stderr)
+            elif args.interpreter == "io":
+                fb_interpret_io(prog, rule, StdoutSink())
+            elif args.interpreter == "traced":
+                sink = BufferedSink()
+                fb_interpret_traced(prog, rule, sink, _global_tracer)
+                for line in sink.lines:
+                    print(line)
+                print(_global_tracer.dump(), file=sys.stderr)
+            elif args.interpreter == "mock":
+                mock = {n: FIZZ if n % 3 == 0 else (BUZZ if n % 5 == 0 else None) for n in range(args.start, args.stop + 1)}
+                _val, lines = fb_interpret_mock(prog, mock)
+                for line in lines:
+                    print(line)
+
+        case "datalog":
+            engine = build_fizzbuzz_datalog(args.start, args.stop)
+            if args.query:
+                results = engine.all_constants(args.query)
+                print(f"{args.query}: {results}")
+            else:
+                for pred in ("fizzbuzz", "prime_fizz", "interesting"):
+                    vals = engine.all_constants(pred)
+                    if vals:
+                        print(f"  {pred:<16} {vals}")
+                print(f"\nTotal facts: {len(engine._facts)}")
+
+        case "zipper":
+            rule = RuleRegistry().get(args.rule)
+            z = zip_rule(rule)
+            print(f"Root: {z.focus!r}")
+            if isinstance(rule, CompositeRule) and rule.rules:
+                z = z.down()
+                print(f"\nEntered composite:")
+                for step in range(len(rule.rules)):
+                    print(f"  [{step}] focus={z.focus!r}  path={z.path()}")
+                    try:
+                        z = z.right()
+                    except IndexError:
+                        break
+                z2 = zip_rule(rule).down()
+                z3 = z2.modify(lambda r: DivisibilityRule(r.divisor * 2, r.label + "!") if isinstance(r, DivisibilityRule) else r)
+                print(f"\nAfter modifying first rule: {z3.root()!r}")
 
         case "rewrite":
             expr = " ".join(args.expr)
