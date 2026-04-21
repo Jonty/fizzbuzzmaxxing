@@ -1954,6 +1954,315 @@ def nbe_fizzbuzz_demo(n_val: int) -> tuple[NbeExpr, NbeExpr]:
 
 
 # ===========================================================================
+# § 2k  Algorithm W  (Hindley–Milner polymorphic type inference)
+# ===========================================================================
+# Algorithm W (Milner, 1978) infers the *most general* (principal) type for
+# every expression without any type annotations, using a combination of
+# Robinson's unification and let-polymorphism:
+#
+#   • Mutable type-variable references (union-find with path compression)
+#   • Unification: destructively set unbound TyVar references
+#   • Generalisation: ∀-quantify variables free in the type but not the context
+#   • Instantiation: replace ∀-bound variables with fresh TVars at every use
+#
+# This lets `let id = λx.x in (id 3, id True)` type-check: id has the
+# polymorphic type ∀a.a→a, and each use is instantiated independently.
+#
+# The same SECD expression language (§ 2i) is used as the subject language.
+
+import itertools as _itertools
+
+_hm_tvar_counter: _itertools.count = _itertools.count()
+
+
+class _HMRef:
+    """Mutable slot for an unbound / bound type variable (union-find node)."""
+    __slots__ = ("id", "ref")
+
+    def __init__(self) -> None:
+        self.id: int = next(_hm_tvar_counter)
+        self.ref: Any = None  # None = unbound; HMType = unified
+
+
+@dataclasses.dataclass
+class HMTVar:
+    var: _HMRef
+
+    def __repr__(self) -> str:
+        t = hm_apply(self)
+        if isinstance(t, HMTVar) and t.var.id == self.var.id:
+            return f"'t{self.var.id}"
+        return repr(t)
+
+
+@dataclasses.dataclass(frozen=True)
+class HMInt:
+    def __repr__(self) -> str: return "Int"
+
+@dataclasses.dataclass(frozen=True)
+class HMBool:
+    def __repr__(self) -> str: return "Bool"
+
+@dataclasses.dataclass(frozen=True)
+class HMStr:
+    def __repr__(self) -> str: return "Str"
+
+@dataclasses.dataclass(frozen=True)
+class HMUnit:
+    def __repr__(self) -> str: return "Unit"
+
+@dataclasses.dataclass
+class HMFun:
+    dom: Any
+    cod: Any
+    def __repr__(self) -> str:
+        return f"({hm_apply(self.dom)!r} → {hm_apply(self.cod)!r})"
+
+
+HMType: TypeAlias = Union[HMTVar, HMInt, HMBool, HMStr, HMUnit, HMFun]
+
+
+# ── type scheme (∀a1…an. ty) ─────────────────────────────────────────────────
+
+@dataclasses.dataclass
+class HMScheme:
+    bound: list  # list[_HMRef]
+    ty: HMType
+
+    def __repr__(self) -> str:
+        if not self.bound:
+            return repr(hm_apply(self.ty))
+        ids = ", ".join(f"'t{v.id}" for v in self.bound)
+        return f"∀{ids}. {hm_apply(self.ty)!r}"
+
+
+HMCtx: TypeAlias = dict[str, HMScheme]
+
+
+# ── core operations ───────────────────────────────────────────────────────────
+
+def fresh_tvar() -> HMTVar:
+    return HMTVar(_HMRef())
+
+
+def hm_apply(ty: HMType) -> HMType:
+    """Chase union-find links with path compression."""
+    while isinstance(ty, HMTVar) and ty.var.ref is not None:
+        ty = ty.var.ref
+    if isinstance(ty, HMTVar) and ty.var.ref is not None:
+        pass
+    if isinstance(ty, HMFun):
+        return HMFun(hm_apply(ty.dom), hm_apply(ty.cod))
+    return ty
+
+
+def _hm_free_ids(ty: HMType) -> set[int]:
+    """IDs of all unbound type variables in ty (after applying)."""
+    ty = hm_apply(ty)
+    match ty:
+        case HMTVar(var=v): return {v.id}
+        case HMFun(dom=d, cod=c): return _hm_free_ids(d) | _hm_free_ids(c)
+        case _: return set()
+
+
+def _hm_occurs(v_id: int, ty: HMType) -> bool:
+    return v_id in _hm_free_ids(ty)
+
+
+def hm_unify(t1: HMType, t2: HMType) -> "Result[None, str]":
+    """Destructive Robinson unification via TyVar mutation."""
+    t1 = hm_apply(t1)
+    t2 = hm_apply(t2)
+    if t1 is t2:
+        return Ok(None)
+    match (t1, t2):
+        case (HMTVar(var=v), _):
+            if isinstance(t2, HMTVar) and t2.var.id == v.id:
+                return Ok(None)
+            if _hm_occurs(v.id, t2):
+                return Err(f"Occurs check: 't{v.id} in {t2!r}")
+            v.ref = t2
+            return Ok(None)
+        case (_, HMTVar()):
+            return hm_unify(t2, t1)
+        case (HMFun(dom=d1, cod=c1), HMFun(dom=d2, cod=c2)):
+            r = hm_unify(d1, d2)
+            if not r.is_ok(): return r
+            return hm_unify(c1, c2)
+        case _ if type(t1) is type(t2) and not isinstance(t1, (HMTVar, HMFun)):
+            return Ok(None)
+        case _:
+            return Err(f"Cannot unify {t1!r} with {t2!r}")
+
+
+def _collect_tvars_in(ty: HMType, target_ids: set[int]) -> list:
+    seen: list = []
+    seen_ids: set[int] = set()
+    def _walk(t: HMType) -> None:
+        t = hm_apply(t)
+        match t:
+            case HMTVar(var=v):
+                if v.id in target_ids and v.id not in seen_ids:
+                    seen.append(v)
+                    seen_ids.add(v.id)
+            case HMFun(dom=d, cod=c):
+                _walk(d); _walk(c)
+    _walk(ty)
+    return seen
+
+
+def _hm_free_in_ctx(ctx: HMCtx) -> set[int]:
+    result: set[int] = set()
+    for scheme in ctx.values():
+        result |= _hm_free_ids(scheme.ty) - {v.id for v in scheme.bound}
+    return result
+
+
+def hm_generalize(ctx: HMCtx, ty: HMType) -> HMScheme:
+    """Quantify free vars in ty that are not free in ctx."""
+    ty = hm_apply(ty)
+    free_ty  = _hm_free_ids(ty)
+    free_ctx = _hm_free_in_ctx(ctx)
+    to_bind  = _collect_tvars_in(ty, free_ty - free_ctx)
+    return HMScheme(to_bind, ty)
+
+
+def _hm_subst_map(ty: HMType, mapping: dict[int, HMTVar]) -> HMType:
+    """Replace specific TyVar ids with new TyVars (for instantiation)."""
+    ty = hm_apply(ty)
+    match ty:
+        case HMTVar(var=v):
+            return mapping.get(v.id, ty)
+        case HMFun(dom=d, cod=c):
+            return HMFun(_hm_subst_map(d, mapping), _hm_subst_map(c, mapping))
+        case _:
+            return ty
+
+
+def hm_instantiate(scheme: HMScheme) -> HMType:
+    """Replace ∀-bound variables with fresh type variables."""
+    if not scheme.bound:
+        return scheme.ty
+    mapping = {v.id: fresh_tvar() for v in scheme.bound}
+    return _hm_subst_map(scheme.ty, mapping)
+
+
+# ── Algorithm W ──────────────────────────────────────────────────────────────
+
+_HM_ARITH = frozenset({"add", "sub", "mul", "mod"})
+_HM_CMP   = frozenset({"eq", "lt"})
+_HM_LOGIC = frozenset({"and", "or"})
+
+
+def algorithm_w(ctx: HMCtx, expr: Any) -> "Result[HMType, str]":
+    """Hindley–Milner Algorithm W; returns the inferred type."""
+    match expr:
+        case EConst(val=v):
+            if isinstance(v, bool): return Ok(HMBool())
+            if isinstance(v, int):  return Ok(HMInt())
+            if isinstance(v, str):  return Ok(HMStr())
+            if v is None:           return Ok(HMUnit())
+            return Ok(HMStr())
+        case EVar(name=x):
+            if x not in ctx:
+                return Err(f"Unbound variable: {x!r}")
+            return Ok(hm_instantiate(ctx[x]))
+        case ELam(param=p, body=b):
+            tv = fresh_tvar()
+            r = algorithm_w({**ctx, p: HMScheme([], tv)}, b)
+            if not r.is_ok(): return r
+            return Ok(HMFun(hm_apply(tv), r.unwrap()))
+        case EApp(fn=f, arg=a):
+            rf = algorithm_w(ctx, f)
+            if not rf.is_ok(): return rf
+            ra = algorithm_w(ctx, a)
+            if not ra.is_ok(): return ra
+            tv = fresh_tvar()
+            ru = hm_unify(rf.unwrap(), HMFun(ra.unwrap(), tv))
+            if not ru.is_ok(): return Err(f"App: {ru.error}")
+            return Ok(hm_apply(tv))
+        case EIf(cond=c, then_=t, else_=e):
+            rc = algorithm_w(ctx, c)
+            if not rc.is_ok(): return rc
+            hm_unify(rc.unwrap(), HMBool())
+            rt = algorithm_w(ctx, t)
+            if not rt.is_ok(): return rt
+            re = algorithm_w(ctx, e)
+            if not re.is_ok(): return re
+            ru = hm_unify(rt.unwrap(), re.unwrap())
+            if not ru.is_ok(): return Err(f"If branches: {ru.error}")
+            return Ok(hm_apply(rt.unwrap()))
+        case EBinOp(op=op, left=l, right=r):
+            rl = algorithm_w(ctx, l)
+            if not rl.is_ok(): return rl
+            rr = algorithm_w(ctx, r)
+            if not rr.is_ok(): return rr
+            if op in _HM_ARITH:
+                for side, ty in (("l", rl.unwrap()), ("r", rr.unwrap())):
+                    ru = hm_unify(ty, HMInt())
+                    if not ru.is_ok(): return Err(f"BinOp {op} {side}: {ru.error}")
+                return Ok(HMInt())
+            elif op in _HM_CMP:
+                ru = hm_unify(rl.unwrap(), rr.unwrap())
+                if not ru.is_ok(): return Err(f"BinOp {op}: {ru.error}")
+                return Ok(HMBool())
+            elif op in _HM_LOGIC:
+                for side, ty in (("l", rl.unwrap()), ("r", rr.unwrap())):
+                    ru = hm_unify(ty, HMBool())
+                    if not ru.is_ok(): return Err(f"BinOp {op} {side}: {ru.error}")
+                return Ok(HMBool())
+            return Err(f"Unknown op: {op!r}")
+        case ELet(var=x, val=v, body=b):
+            rv = algorithm_w(ctx, v)
+            if not rv.is_ok(): return rv
+            scheme = hm_generalize(ctx, rv.unwrap())
+            return algorithm_w({**ctx, x: scheme}, b)
+        case EFizzBuzz():
+            return Ok(HMFun(HMInt(), HMStr()))
+        case _:
+            return Ok(fresh_tvar())
+
+
+def hm_infer_program(exprs: list[tuple[str, Any]],
+                     ctx: HMCtx | None = None) -> list[tuple[str, str]]:
+    """Infer types for a list of (name, expr) pairs."""
+    base_ctx = dict(ctx or {})
+    results = []
+    for name, expr in exprs:
+        r = algorithm_w(base_ctx, expr)
+        if r.is_ok():
+            results.append((name, f"✓  {hm_apply(r.unwrap())!r}"))
+        else:
+            results.append((name, f"✗  {r.error}"))
+    return results
+
+
+def _hm_fizzbuzz_suite() -> list[tuple[str, Any]]:
+    """Expressions to demonstrate HM inference including let-polymorphism."""
+    # Polymorphic identity: ∀a. a → a
+    poly_id = ELam("x", EVar("x"))
+    # Uses id at two different types in the same let body
+    poly_use = ELet("id", poly_id,
+                    EIf(EApp(EVar("id"), EConst(True)),
+                        EApp(EVar("id"), EConst(42)),
+                        EConst(0)))
+    compose = ELam("f", ELam("g", ELam("x",
+                   EApp(EVar("f"), EApp(EVar("g"), EVar("x"))))))
+    fb_app = EApp(EFizzBuzz(), EConst(15))
+    ill_typed = EBinOp("add", EConst(True), EConst(1))
+    let_poly = ELet("f", ELam("n", EBinOp("mul", EVar("n"), EConst(2))),
+                    EApp(EVar("f"), EConst(7)))
+    return [
+        ("identity function",         poly_id),
+        ("let id in (id True, id 42)", poly_use),
+        ("compose (∀a,b,c.(b→c)→(a→b)→a→c)", compose),
+        ("fizzbuzz 15",               fb_app),
+        ("ill-typed: True + 1",       ill_typed),
+        ("let f=λn.n*2 in f 7",       let_poly),
+    ]
+
+
+# ===========================================================================
 # § 3  Event bus
 # ===========================================================================
 
@@ -3552,6 +3861,178 @@ def _bidir_fizzbuzz_suite() -> list[tuple[str, Any, "SimpleType | None"]]:
               EApp(EVar("f"), EConst(7))),
          STInt()),
     ]
+
+
+# ===========================================================================
+# § 6h  Arc consistency (AC-3) constraint propagation
+# ===========================================================================
+# AC-3 (Mackworth, 1977) enforces *arc consistency* in a Constraint
+# Satisfaction Problem (CSP): for every constraint arc (Xi, Xj), every value
+# in domain(Xi) must have *some* supporting value in domain(Xj).  Values
+# without support are pruned.  Repeat until no more pruning occurs.
+#
+# AC-3 complexity: O(e·d³) where e = arcs, d = max domain size.
+#
+# FizzBuzz CSP:  we model the FizzBuzz classifier as a network of variables
+#   mod3    ∈ {0,1,2}          – n mod 3  (grounded per n)
+#   mod5    ∈ {0,1,2,3,4}      – n mod 5  (grounded per n)
+#   has_fizz ∈ {True, False}
+#   has_buzz ∈ {True, False}
+#   label    ∈ {"Fizz","Buzz","FizzBuzz",None}
+#
+# Binary arc constraints link these variables; AC-3 propagates a single known
+# value of mod3/mod5 to uniquely determine the FizzBuzz label.
+
+import collections as _collections
+
+@dataclasses.dataclass
+class _CSPVar:
+    name: str
+    domain: set  # current domain (mutable set)
+
+
+@dataclasses.dataclass
+class _CSPArc:
+    xi: str   # variable names
+    xj: str
+    pred: Callable  # pred(vi, vj) → bool  — vi in domain(xi), vj in domain(xj)
+
+
+class CSP:
+    """A constraint satisfaction problem."""
+
+    def __init__(self, variables: list[_CSPVar], arcs: list[_CSPArc]) -> None:
+        self.variables: dict[str, _CSPVar] = {v.name: v for v in variables}
+        self.arcs = arcs
+        # Build adjacency: var → list of arcs that involve var
+        self._adj: dict[str, list[_CSPArc]] = _collections.defaultdict(list)
+        for arc in arcs:
+            self._adj[arc.xi].append(arc)
+            self._adj[arc.xj].append(arc)
+
+    def domain(self, name: str) -> set:
+        return self.variables[name].domain
+
+    def clone(self) -> "CSP":
+        """Deep copy for backtracking."""
+        cloned_vars = [_CSPVar(v.name, set(v.domain)) for v in self.variables.values()]
+        return CSP(cloned_vars, self.arcs)
+
+
+def _ac3_revise(csp: CSP, xi: str, xj: str, arc: _CSPArc) -> bool:
+    """
+    Remove values from domain(xi) that have no support in domain(xj).
+    Returns True iff the domain was reduced.
+    """
+    to_remove: set = set()
+    for vi in list(csp.domain(xi)):
+        # Does any vj in domain(xj) satisfy the constraint with vi?
+        if arc.xi == xi:
+            supported = any(arc.pred(vi, vj) for vj in csp.domain(xj))
+        else:
+            supported = any(arc.pred(vj, vi) for vj in csp.domain(xj))
+        if not supported:
+            to_remove.add(vi)
+    csp.domain(xi).difference_update(to_remove)
+    return bool(to_remove)
+
+
+def ac3(csp: CSP) -> bool:
+    """
+    Enforce arc consistency on csp (in place).
+    Returns False if any domain becomes empty (unsatisfiable).
+    """
+    queue: _collections.deque = _collections.deque()
+    # Initialise queue with both directions of every arc
+    for arc in csp.arcs:
+        queue.append((arc.xi, arc.xj, arc))
+        queue.append((arc.xj, arc.xi, arc))
+
+    while queue:
+        xi, xj, arc = queue.popleft()
+        if _ac3_revise(csp, xi, xj, arc):
+            if not csp.domain(xi):
+                return False   # domain wiped out → unsatisfiable
+            # Re-enqueue all arcs (xk, xi) for neighbours xk ≠ xj
+            for other_arc in csp._adj[xi]:
+                xk = other_arc.xj if other_arc.xi == xi else other_arc.xi
+                if xk != xj:
+                    queue.append((xk, xi, other_arc))
+    return True
+
+
+def ac3_backtrack(csp: CSP) -> dict[str, Any] | None:
+    """
+    Full backtracking search with AC-3 as constraint propagator.
+    Returns a complete assignment or None if unsatisfiable.
+    """
+    # Find unassigned variable (domain size > 1) — MRV heuristic
+    unassigned = [v for v in csp.variables.values() if len(v.domain) > 1]
+    if not unassigned:
+        # Check all singletons are consistent
+        return {n: next(iter(v.domain)) for n, v in csp.variables.items()}
+    # Minimum remaining values heuristic
+    var = min(unassigned, key=lambda v: len(v.domain))
+    for value in sorted(var.domain, key=str):
+        child = csp.clone()
+        child.domain(var.name).clear()
+        child.domain(var.name).add(value)
+        if ac3(child):
+            result = ac3_backtrack(child)
+            if result is not None:
+                return result
+    return None
+
+
+# ── FizzBuzz CSP builder ──────────────────────────────────────────────────────
+
+def _fizzbuzz_csp(n_val: int) -> CSP:
+    """Build the FizzBuzz classification CSP for a specific n."""
+    variables = [
+        _CSPVar("mod3",     {n_val % 3}),      # known ground fact
+        _CSPVar("mod5",     {n_val % 5}),      # known ground fact
+        _CSPVar("has_fizz", {True, False}),
+        _CSPVar("has_buzz", {True, False}),
+        _CSPVar("label",    {"Fizz", "Buzz", "FizzBuzz", None}),
+    ]
+    arcs = [
+        _CSPArc("mod3",     "has_fizz",
+                lambda m, f: (m == 0) == f),
+        _CSPArc("mod5",     "has_buzz",
+                lambda m, b: (m == 0) == b),
+        _CSPArc("has_fizz", "label",
+                lambda f, l: (f and l in {"Fizz", "FizzBuzz"})
+                          or (not f and l in {"Buzz", None})),
+        _CSPArc("has_buzz", "label",
+                lambda b, l: (b and l in {"Buzz", "FizzBuzz"})
+                          or (not b and l in {"Fizz", None})),
+    ]
+    return CSP(variables, arcs)
+
+
+def csp_classify(n_val: int) -> dict[str, Any]:
+    """Use AC-3 to determine the FizzBuzz label for n."""
+    csp = _fizzbuzz_csp(n_val)
+    ac3(csp)
+    return {name: (next(iter(d)) if len(d) == 1 else sorted(d, key=str))
+            for name, var in csp.variables.items() for d in (var.domain,)}
+
+
+def csp_fizzbuzz_range(start: int, stop: int) -> list[tuple[int, Any]]:
+    """Classify [start..stop] via AC-3 constraint propagation."""
+    return [(n, csp_classify(n).get("label")) for n in range(start, stop + 1)]
+
+
+def csp_build_nqueens(n: int) -> CSP:
+    """N-Queens CSP as a non-FizzBuzz bonus demo."""
+    variables = [_CSPVar(f"q{i}", set(range(n))) for i in range(n)]
+    arcs = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            def _neq_diag(vi: int, vj: int, _i: int = i, _j: int = j) -> bool:
+                return vi != vj and abs(vi - vj) != abs(_i - _j)
+            arcs.append(_CSPArc(f"q{i}", f"q{j}", _neq_diag))
+    return CSP(variables, arcs)
 
 
 # ===========================================================================
@@ -5198,6 +5679,150 @@ def treap_label_index(rule: Any, start: int, stop: int) -> Any:
         ns = existing.unwrap() if existing.is_ok() else []
         t = _treap_insert_impl(t, label, ns + [n])
     return t
+
+
+# ===========================================================================
+# § 10g  Fenwick tree  (Binary Indexed Tree / BIT)
+# ===========================================================================
+# A Fenwick tree (Fenwick, 1994) supports two operations on a 1-indexed array:
+#   update(i, delta)   O(log n) — add delta to element i
+#   prefix_sum(i)      O(log n) — sum of elements [1..i]
+#
+# The trick: store partial sums in a BIT where tree[i] holds the sum of
+# elements in the range [i - lowbit(i) + 1 .. i], where lowbit(i) = i & -i.
+#
+# Derived operations:
+#   range_sum(lo, hi)  = prefix_sum(hi) - prefix_sum(lo-1)
+#   find_kth(k)        O(log² n) — index of the k-th element by binary search
+#   point_query(i)     = range_sum(i, i)
+#
+# 2D variant: BIT2D supports range_sum(x1,y1,x2,y2) in O(log² n).
+#
+# FizzBuzz application: assign each label category a "weight" and support
+# rank queries: "how many Fizz labels appear in positions [1..n]?"
+
+class FenwickTree:
+    """1-indexed BIT (Fenwick tree) supporting point updates and prefix sums."""
+
+    def __init__(self, n: int, initial: list[int] | None = None) -> None:
+        self.n = n
+        self._tree = [0] * (n + 1)
+        if initial:
+            for i, v in enumerate(initial, 1):
+                self.update(i, v)
+
+    def update(self, i: int, delta: int) -> None:
+        """Add delta to position i (1-indexed)."""
+        while i <= self.n:
+            self._tree[i] += delta
+            i += i & (-i)
+
+    def prefix_sum(self, i: int) -> int:
+        """Sum of elements [1..i]."""
+        i = min(i, self.n)
+        s = 0
+        while i > 0:
+            s += self._tree[i]
+            i -= i & (-i)
+        return s
+
+    def range_sum(self, lo: int, hi: int) -> int:
+        """Sum of elements [lo..hi] (inclusive, 1-indexed)."""
+        if lo > hi: return 0
+        return self.prefix_sum(hi) - self.prefix_sum(lo - 1)
+
+    def point_query(self, i: int) -> int:
+        return self.range_sum(i, i)
+
+    def find_kth(self, k: int) -> int:
+        """
+        Find smallest index i such that prefix_sum(i) >= k.
+        O(log n) via binary lifting.
+        """
+        pos = 0
+        bit_mask = 1 << (self.n.bit_length())
+        while bit_mask > 0:
+            nxt = pos + bit_mask
+            if nxt <= self.n and self._tree[nxt] < k:
+                pos = nxt
+                k -= self._tree[pos]
+            bit_mask >>= 1
+        return pos + 1
+
+    def total(self) -> int:
+        return self.prefix_sum(self.n)
+
+    def __repr__(self) -> str:
+        return f"FenwickTree(n={self.n}, total={self.total()})"
+
+
+class FenwickTree2D:
+    """2D BIT: update(x,y,delta) and prefix_sum(x,y) = sum over [1..x,1..y]."""
+
+    def __init__(self, rows: int, cols: int) -> None:
+        self.rows = rows
+        self.cols = cols
+        self._tree: list[list[int]] = [[0] * (cols + 1) for _ in range(rows + 1)]
+
+    def update(self, x: int, y: int, delta: int) -> None:
+        i = x
+        while i <= self.rows:
+            j = y
+            while j <= self.cols:
+                self._tree[i][j] += delta
+                j += j & (-j)
+            i += i & (-i)
+
+    def prefix_sum(self, x: int, y: int) -> int:
+        s = 0
+        i = min(x, self.rows)
+        while i > 0:
+            j = min(y, self.cols)
+            while j > 0:
+                s += self._tree[i][j]
+                j -= j & (-j)
+            i -= i & (-i)
+        return s
+
+    def range_sum(self, x1: int, y1: int, x2: int, y2: int) -> int:
+        return (self.prefix_sum(x2, y2)
+                - self.prefix_sum(x1 - 1, y2)
+                - self.prefix_sum(x2, y1 - 1)
+                + self.prefix_sum(x1 - 1, y1 - 1))
+
+
+# ── FizzBuzz domain application ───────────────────────────────────────────────
+
+_LABEL_CODE: dict[Any, int] = {None: 0, "Fizz": 1, "Buzz": 2, "FizzBuzz": 3}
+_CODE_LABEL: dict[int, Any] = {v: k for k, v in _LABEL_CODE.items()}
+
+
+def build_fizzbuzz_fenwick(rule: Any, start: int, stop: int) -> dict[str, FenwickTree]:
+    """
+    Build per-label Fenwick trees so we can answer:
+    'How many times does label X appear in [start..k]?'
+    """
+    n = stop - start + 1
+    trees = {lbl: FenwickTree(n) for lbl in ("Fizz", "Buzz", "FizzBuzz", "plain")}
+    for idx, pos in enumerate(range(start, stop + 1), 1):
+        lbl = rule(Number(pos))
+        key = lbl if lbl in trees else "plain"
+        trees[key].update(idx, 1)
+    return trees
+
+
+def fenwick_rank_query(trees: dict[str, FenwickTree], start: int, lo: int, hi: int) -> dict[str, int]:
+    """Count label occurrences in n ∈ [lo..hi] given trees built from start."""
+    lo_idx = lo - start + 1
+    hi_idx = hi - start + 1
+    return {lbl: t.range_sum(lo_idx, hi_idx) for lbl, t in trees.items()}
+
+
+def fizzbuzz_prefix_ranks(rule: Any, start: int, stop: int,
+                           query_at: int) -> dict[str, int]:
+    """How many of each label appear in [start..query_at]?"""
+    trees = build_fizzbuzz_fenwick(rule, start, stop)
+    return fenwick_rank_query(trees, start, start, query_at)
 
 
 # ===========================================================================
@@ -7167,6 +7792,174 @@ def rope_stats(r: Rope) -> dict[str, Any]:
         "depth": depth,
         "avg_leaf_len": length / max(len(leaves), 1),
     }
+
+
+# ===========================================================================
+# § 13k  Pairing heap  (simple, practical O(log n) amortised priority queue)
+# ===========================================================================
+# A pairing heap (Fredman et al., 1986) is a leftist-style heap with the
+# simplest possible merge operation: just link the root with the higher key
+# under the root with the lower key.
+#
+#   merge(h1, h2): O(1) — link smaller root under larger root
+#   insert(h, k, v): O(1) — merge singleton into heap
+#   find_min(h): O(1) — read root
+#   delete_min(h): O(log n) amortised — two-pass pairing of children
+#
+# The two-pass pairing in delete_min:
+#   1. Pair adjacent children left-to-right (merge pairs)
+#   2. Merge the resulting list right-to-left
+#
+# This gives O(log n) amortised delete_min and O(1) insert, making pairing
+# heaps excellent for Dijkstra's algorithm.
+#
+# FizzBuzz application: priority-queue scheduling — emit FizzBuzz outputs in
+# order by label priority (FizzBuzz first, then Fizz, then Buzz, then plain).
+
+@dataclasses.dataclass
+class PHeap:
+    """A single pairing-heap node."""
+    key: Any           # priority (lower = higher priority)
+    value: Any
+    children: list     # list[PHeap]  (mutable — but heap is used functionally)
+
+    def __lt__(self, other: "PHeap") -> bool:
+        return self.key < other.key
+
+
+_PHEAP_EMPTY: "PHeap | None" = None
+
+
+def pheap_empty() -> None:
+    return _PHEAP_EMPTY
+
+
+def pheap_is_empty(h: Any) -> bool:
+    return h is None
+
+
+def pheap_singleton(key: Any, value: Any) -> PHeap:
+    return PHeap(key, value, [])
+
+
+def pheap_merge(h1: Any, h2: Any) -> Any:
+    """O(1) merge: link the larger-key root under the smaller-key root."""
+    if h1 is None: return h2
+    if h2 is None: return h1
+    if h1.key <= h2.key:
+        return PHeap(h1.key, h1.value, [h2] + h1.children)
+    return PHeap(h2.key, h2.value, [h1] + h2.children)
+
+
+def pheap_insert(h: Any, key: Any, value: Any) -> PHeap:
+    """O(1) insert."""
+    return pheap_merge(h, pheap_singleton(key, value))
+
+
+def pheap_find_min(h: Any) -> tuple[Any, Any]:
+    """O(1) peek at minimum."""
+    if h is None:
+        raise IndexError("pheap_find_min: empty heap")
+    return h.key, h.value
+
+
+def _pheap_merge_pairs(children: list) -> Any:
+    """Two-pass pairing of a list of heaps."""
+    if not children:
+        return None
+    if len(children) == 1:
+        return children[0]
+    # Forward pass: pair adjacent siblings
+    pairs = []
+    for i in range(0, len(children) - 1, 2):
+        pairs.append(pheap_merge(children[i], children[i + 1]))
+    if len(children) % 2 == 1:
+        pairs.append(children[-1])
+    # Backward pass: fold right
+    result = pairs[-1]
+    for i in range(len(pairs) - 2, -1, -1):
+        result = pheap_merge(pairs[i], result)
+    return result
+
+
+def pheap_delete_min(h: Any) -> Any:
+    """O(log n) amortised: remove minimum element."""
+    if h is None:
+        raise IndexError("pheap_delete_min: empty heap")
+    return _pheap_merge_pairs(h.children)
+
+
+def pheap_from_iter(items: list[tuple[Any, Any]]) -> Any:
+    """Build a pairing heap from (key, value) pairs."""
+    h: Any = None
+    for key, value in items:
+        h = pheap_insert(h, key, value)
+    return h
+
+
+def pheap_drain(h: Any) -> list[tuple[Any, Any]]:
+    """Extract all (key, value) pairs in sorted order by key."""
+    result = []
+    while h is not None:
+        k, v = pheap_find_min(h)
+        result.append((k, v))
+        h = pheap_delete_min(h)
+    return result
+
+
+def pheap_size(h: Any) -> int:
+    """Count all elements (O(n))."""
+    if h is None: return 0
+    return 1 + sum(pheap_size(c) for c in h.children)
+
+
+# ── FizzBuzz domain application ───────────────────────────────────────────────
+
+_LABEL_PRIORITY: dict[Any, int] = {
+    "FizzBuzz": 0,
+    "Fizz":     1,
+    "Buzz":     2,
+    None:       3,   # plain number
+}
+
+
+def fizzbuzz_priority_queue(rule: Any, start: int, stop: int) -> list[tuple[int, int, Any]]:
+    """
+    Schedule FizzBuzz outputs via a pairing heap.
+    Returns items sorted by (label_priority, n).
+    """
+    h: Any = None
+    for n in range(start, stop + 1):
+        label = rule(Number(n))
+        pri = _LABEL_PRIORITY.get(label, 3)
+        # secondary key = n for stable ordering within same priority
+        h = pheap_insert(h, (pri, n), (n, label))
+    return [(n, lbl) for (_, _), (n, lbl) in
+            ((key, val) for key, val in pheap_drain(h))]
+
+
+def fizzbuzz_merge_schedule(rule: Any, start: int, stop: int,
+                             n_workers: int = 4) -> list[tuple[int, Any]]:
+    """
+    Simulate a multi-worker FizzBuzz: each worker produces a heap shard,
+    then we merge all shards into one via repeated pheap_merge.
+    """
+    chunk = max(1, (stop - start + 1) // n_workers)
+    heaps: list[Any] = []
+    for i in range(n_workers):
+        lo = start + i * chunk
+        hi = min(lo + chunk - 1, stop)
+        if lo > stop: break
+        h: Any = None
+        for n in range(lo, hi + 1):
+            label = rule(Number(n))
+            h = pheap_insert(h, n, label)
+        heaps.append(h)
+    # Merge all heaps
+    merged: Any = None
+    for h in heaps:
+        merged = pheap_merge(merged, h)
+    return pheap_drain(merged)
 
 
 # ===========================================================================
@@ -9163,6 +9956,241 @@ def prob_run_fizzbuzz_queries(rule: Any, lo: int, hi: int,
 
 
 # ===========================================================================
+# § 19j  Stream fusion  (pull-based stepper with deforestation)
+# ===========================================================================
+# Stream fusion (Coutts, Leshchinskiy & Stewart, 2007) eliminates intermediate
+# data structures when composing pipeline operations.  The key representation:
+#
+#   Stream[A] = ∃S. { state: S, step: S → Step[A,S] }
+#
+#   Step[A,S] = Done               – stream exhausted
+#             | Skip(s: S)         – advance state without yielding
+#             | Yield(a: A, s: S)  – emit element a, advance to s
+#
+# Composition is *structural*: smap(sfilter(s, p), f) produces a single
+# combined stepper that never builds an intermediate list.  The Skip
+# constructor is essential for filter — it allows the stepper to skip elements
+# while the outer driver loops until a Yield or Done.
+#
+# Operations (all fuse):
+#   stream_of(list)              → Stream from list
+#   smap(s, f)                   → transform elements
+#   sfilter(s, pred)             → keep elements satisfying pred
+#   stake(s, n)                  → first n elements
+#   sdrop(s, n)                  → skip first n elements
+#   szip(s1, s2)                 → pairwise zip
+#   sflatmap(s, f)               → monadic bind (introduces Skip for inner advance)
+#   sscan(s, init, f)            → running accumulator
+#   srun(s) → list               → materialise (the *only* allocation)
+
+@dataclasses.dataclass(frozen=True)
+class SDone:
+    pass
+
+@dataclasses.dataclass(frozen=True)
+class SSkip:
+    state: Any
+
+@dataclasses.dataclass(frozen=True)
+class SYield:
+    value: Any
+    state: Any
+
+_Step: TypeAlias = Union[SDone, SSkip, SYield]
+
+
+@dataclasses.dataclass
+class FStream:
+    """A pull-based fused stream."""
+    state: Any
+    step: Callable  # state → _Step
+
+    # ── combinators (all produce new FStream objects, no allocation) ────────
+
+    def map(self, f: Callable) -> "FStream":
+        def _step(s: Any) -> _Step:
+            match self.step(s):
+                case SDone():           return SDone()
+                case SSkip(state=s2):  return SSkip(s2)
+                case SYield(value=v, state=s2): return SYield(f(v), s2)
+        return FStream(self.state, _step)
+
+    def filter(self, pred: Callable) -> "FStream":
+        def _step(s: Any) -> _Step:
+            match self.step(s):
+                case SDone():           return SDone()
+                case SSkip(state=s2):  return SSkip(s2)
+                case SYield(value=v, state=s2):
+                    return SYield(v, s2) if pred(v) else SSkip(s2)
+        return FStream(self.state, _step)
+
+    def take(self, n: int) -> "FStream":
+        def _step(state_n: tuple) -> _Step:
+            s, remaining = state_n
+            if remaining == 0:
+                return SDone()
+            match self.step(s):
+                case SDone():           return SDone()
+                case SSkip(state=s2):  return SSkip((s2, remaining))
+                case SYield(value=v, state=s2): return SYield(v, (s2, remaining - 1))
+        return FStream((self.state, n), _step)
+
+    def drop(self, n: int) -> "FStream":
+        def _step(state_n: tuple) -> _Step:
+            s, skipped = state_n
+            if skipped < n:
+                match self.step(s):
+                    case SDone():           return SDone()
+                    case SSkip(state=s2):  return SSkip((s2, skipped))
+                    case SYield(state=s2): return SSkip((s2, skipped + 1))
+            return self.step(s) if not isinstance(self.step(s), SYield) else \
+                (lambda r: SYield(r.value, (r.state, n)))(self.step(s))
+        # Simpler: materialise drop eagerly
+        def _step2(state_n: tuple) -> _Step:
+            s, remaining_drops = state_n
+            r = self.step(s)
+            match r:
+                case SDone():
+                    return SDone()
+                case SSkip(state=s2):
+                    return SSkip((s2, remaining_drops))
+                case SYield(value=v, state=s2):
+                    if remaining_drops > 0:
+                        return SSkip((s2, remaining_drops - 1))
+                    return SYield(v, (s2, 0))
+        return FStream((self.state, n), _step2)
+
+    def scan(self, init: Any, f: Callable) -> "FStream":
+        """Running accumulator — yields the accumulator before each element."""
+        def _step(state_acc: tuple) -> _Step:
+            s, acc = state_acc
+            r = self.step(s)
+            match r:
+                case SDone():           return SDone()
+                case SSkip(state=s2):  return SSkip((s2, acc))
+                case SYield(value=v, state=s2):
+                    new_acc = f(acc, v)
+                    return SYield(new_acc, (s2, new_acc))
+        return FStream((self.state, init), _step)
+
+    def zip_with(self, other: "FStream", f: Callable) -> "FStream":
+        """Zip two streams element-wise with a combining function."""
+        def _step(state_pair: tuple) -> _Step:
+            s1, s2 = state_pair
+            r1 = self.step(s1)
+            match r1:
+                case SDone(): return SDone()
+                case SSkip(state=s1_): return SSkip((s1_, s2))
+                case SYield(value=v1, state=s1_):
+                    r2 = other.step(s2)
+                    match r2:
+                        case SDone(): return SDone()
+                        case SSkip(state=s2_): return SSkip((s1, s2_))
+                        case SYield(value=v2, state=s2_):
+                            return SYield(f(v1, v2), (s1_, s2_))
+        return FStream((self.state, other.state), _step)
+
+    def run(self) -> list:
+        """Materialise the stream into a list (the only place allocation occurs)."""
+        result = []
+        s = self.state
+        while True:
+            match self.step(s):
+                case SDone():
+                    return result
+                case SSkip(state=s2):
+                    s = s2
+                case SYield(value=v, state=s2):
+                    result.append(v)
+                    s = s2
+
+    def fold(self, init: Any, f: Callable) -> Any:
+        """Reduce without materialising."""
+        acc = init
+        s = self.state
+        while True:
+            match self.step(s):
+                case SDone():           return acc
+                case SSkip(state=s2):  s = s2
+                case SYield(value=v, state=s2):
+                    acc = f(acc, v)
+                    s = s2
+
+    def count(self) -> int:
+        return self.fold(0, lambda acc, _: acc + 1)
+
+    def first(self) -> Any:
+        s = self.state
+        while True:
+            match self.step(s):
+                case SDone(): return None
+                case SSkip(state=s2): s = s2
+                case SYield(value=v): return v
+
+
+def stream_of(items: list) -> FStream:
+    """Create a stream from a list (state = index)."""
+    def _step(i: int) -> _Step:
+        if i >= len(items):
+            return SDone()
+        return SYield(items[i], i + 1)
+    return FStream(0, _step)
+
+
+def stream_range(start: int, stop: int) -> FStream:
+    """Create a stream of integers [start..stop] without building a list."""
+    def _step(n: int) -> _Step:
+        if n > stop:
+            return SDone()
+        return SYield(n, n + 1)
+    return FStream(start, _step)
+
+
+def stream_unfold(seed: Any, f: Callable) -> FStream:
+    """Anamorphism: f(seed) → None (stop) or (value, new_seed)."""
+    def _step(s: Any) -> _Step:
+        result = f(s)
+        if result is None:
+            return SDone()
+        v, s2 = result
+        return SYield(v, s2)
+    return FStream(seed, _step)
+
+
+# ── FizzBuzz domain application ───────────────────────────────────────────────
+
+def fizzbuzz_stream(rule: Any, start: int) -> FStream:
+    """Infinite fused stream of (n, label) pairs starting at start."""
+    return stream_unfold(start, lambda n: ((n, rule(Number(n))), n + 1))
+
+
+def fizzbuzz_fused_pipeline(rule: Any, start: int, stop: int) -> list[str]:
+    """
+    Demonstrate fusion: compose filter + map + take in one pass with no
+    intermediate list.  Yields only labelled outputs (Fizz/Buzz/FizzBuzz).
+    """
+    return (stream_range(start, stop)
+            .map(lambda n: (n, rule(Number(n))))
+            .filter(lambda pair: pair[1] is not None)
+            .map(lambda pair: f"{pair[0]}: {pair[1]}")
+            .run())
+
+
+def fizzbuzz_scan_counts(rule: Any, start: int, stop: int) -> list[dict[str, int]]:
+    """Running label counts via stream scan."""
+    def _update(counts: dict, pair: tuple) -> dict:
+        n, lbl = pair
+        key = lbl or "plain"
+        return {**counts, key: counts.get(key, 0) + 1}
+
+    return (stream_range(start, stop)
+            .map(lambda n: (n, rule(Number(n))))
+            .scan({}, _update)
+            .take(stop - start + 1)
+            .run())
+
+
+# ===========================================================================
 # § 20  Interactive REPL
 # ===========================================================================
 
@@ -9678,6 +10706,11 @@ def run_repl() -> None:
                     "  cms                          — Count-Min Sketch frequency estimation\n"
                     "  frp                          — arrowized FRP Behavior/Event network\n"
                     "  green                        — cooperative green-thread FizzBuzz\n"
+                    "  algw                         — Algorithm W Hindley–Milner type inference\n"
+                    "  ac3 [n …]                    — AC-3 arc consistency FizzBuzz CSP\n"
+                    "  fenwick                      — Fenwick tree prefix rank queries\n"
+                    "  pheap                        — pairing heap priority schedule\n"
+                    "  fstream                      — fused stream pipeline (map/filter/scan)\n"
                     "  nbe [n]                      — normalization by evaluation (NbE)\n"
                     "  typecheck                    — bidirectional type checker for mini-lambda\n"
                     "  treap                        — treap (randomised BST) operations\n"
@@ -9769,6 +10802,62 @@ def run_repl() -> None:
                         print(f"  … ({len(result_map) - 20} more)")
                 else:
                     print("  (no results — try increasing max_ticks or reducing range)")
+
+            case "algw":
+                suite = _hm_fizzbuzz_suite()
+                results_w = hm_infer_program(suite)
+                print("  Algorithm W (Hindley–Milner) inference:")
+                for name, res in results_w:
+                    print(f"    {name:<45}  {res}")
+
+            case "ac3":
+                n_vals = [int(p) for p in parts[1:]] if len(parts) > 1 else [3, 5, 15, 7]
+                for n_val in n_vals:
+                    info = csp_classify(n_val)
+                    print(f"  AC-3 classify n={n_val}: {info}")
+
+            case "fenwick":
+                rule = RuleRegistry().get(state["rule"])
+                lo, hi = state["start"], state["stop"]
+                trees = build_fizzbuzz_fenwick(rule, lo, hi)
+                mid = (lo + hi) // 2
+                counts = fenwick_rank_query(trees, lo, lo, mid)
+                print(f"  Fenwick prefix counts [{lo}..{mid}]: {counts}")
+                # find_kth demo
+                fizz_tree = trees["Fizz"]
+                if fizz_tree.total() >= 2:
+                    print(f"  2nd Fizz position (offset): {fizz_tree.find_kth(2)}")
+                full = {lbl: t.total() for lbl, t in trees.items()}
+                print(f"  Totals [{lo}..{hi}]: {full}")
+
+            case "pheap":
+                rule = RuleRegistry().get(state["rule"])
+                lo, hi = state["start"], state["stop"]
+                scheduled = fizzbuzz_priority_queue(rule, lo, hi)
+                print(f"  Pairing-heap priority schedule [{lo}..{hi}]:")
+                prev_pri = -1
+                for n_val, lbl in scheduled[:30]:
+                    pri = _LABEL_PRIORITY.get(lbl, 3)
+                    if pri != prev_pri:
+                        print(f"    --- priority {pri} ({lbl!r}) ---")
+                        prev_pri = pri
+                    print(f"    {n_val:>4}  {lbl!r}")
+                if len(scheduled) > 30:
+                    print(f"    … ({len(scheduled)-30} more)")
+
+            case "fstream":
+                rule = RuleRegistry().get(state["rule"])
+                lo, hi = state["start"], state["stop"]
+                labelled = fizzbuzz_fused_pipeline(rule, lo, hi)
+                print(f"  Fused stream — labelled outputs [{lo}..{hi}]:")
+                for ln in labelled[:20]:
+                    print(f"    {ln}")
+                if len(labelled) > 20:
+                    print(f"    … ({len(labelled)-20} more)")
+                # Running counts via scan
+                counts_stream = fizzbuzz_scan_counts(rule, lo, min(hi, lo+14))
+                last = counts_stream[-1] if counts_stream else {}
+                print(f"\n  Running counts after {min(hi, lo+14)}: {last}")
 
             case "nbe":
                 n_demo = int(parts[1]) if len(parts) > 1 else 9
@@ -10216,6 +11305,39 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
     gr_p.add_argument("--stop",    type=int, default=30)
     gr_p.add_argument("--rule",    default="classic")
     gr_p.add_argument("--workers", type=int, default=4)
+
+    # ── algw ──────────────────────────────────────────────────────────────────
+    sub.add_parser("algw", help="Algorithm W Hindley–Milner type inference")
+
+    # ── ac3 ───────────────────────────────────────────────────────────────────
+    ac3_p = sub.add_parser("ac3", help="AC-3 arc consistency constraint propagation")
+    ac3_p.add_argument("--start",  type=int, default=1)
+    ac3_p.add_argument("--stop",   type=int, default=30)
+    ac3_p.add_argument("--nqueens", type=int, default=0, metavar="N",
+                       help="Solve N-Queens CSP via AC-3 + backtracking")
+
+    # ── fenwick ───────────────────────────────────────────────────────────────
+    fw_p = sub.add_parser("fenwick", help="Fenwick tree (BIT) prefix rank queries")
+    fw_p.add_argument("--start",    type=int, default=1)
+    fw_p.add_argument("--stop",     type=int, default=100)
+    fw_p.add_argument("--rule",     default="classic")
+    fw_p.add_argument("--query-at", type=int, default=None, metavar="N",
+                      help="Position to query prefix counts at")
+
+    # ── pheap ─────────────────────────────────────────────────────────────────
+    ph_p = sub.add_parser("pheap", help="Pairing heap priority queue demo")
+    ph_p.add_argument("--start",   type=int, default=1)
+    ph_p.add_argument("--stop",    type=int, default=30)
+    ph_p.add_argument("--rule",    default="classic")
+    ph_p.add_argument("--workers", type=int, default=4,
+                      help="Number of shards for merge demo")
+
+    # ── fstream ───────────────────────────────────────────────────────────────
+    fs_p = sub.add_parser("fstream", help="Fused stream pipeline (map/filter/scan/zip)")
+    fs_p.add_argument("--start",  type=int, default=1)
+    fs_p.add_argument("--stop",   type=int, default=100)
+    fs_p.add_argument("--rule",   default="classic")
+    fs_p.add_argument("--mode",   choices=["labelled", "scan", "zip"], default="labelled")
 
     # ── nbe ───────────────────────────────────────────────────────────────────
     nbe_p = sub.add_parser("nbe", help="Normalization by Evaluation (NbE)")
@@ -10848,6 +11970,95 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
             for n_val in sorted(result_map.keys()):
                 print(f"  {n_val:>4}  {result_map[n_val]}")
             print(f"\n  {len(result_map)} results collected", file=sys.stderr)
+
+        case "algw":
+            suite = _hm_fizzbuzz_suite()
+            results_w = hm_infer_program(suite)
+            print("Algorithm W (Hindley–Milner) type inference:")
+            for name, res in results_w:
+                print(f"  {name:<45}  {res}")
+
+        case "ac3":
+            if args.nqueens > 0:
+                n = args.nqueens
+                csp_q = csp_build_nqueens(n)
+                if ac3(csp_q):
+                    soln = ac3_backtrack(csp_q)
+                    if soln:
+                        board = [soln[f"q{i}"] for i in range(n)]
+                        print(f"{n}-Queens solution: {board}")
+                        for row in range(n):
+                            print("  " + "".join(
+                                "Q " if board[col] == row else ". "
+                                for col in range(n)))
+                    else:
+                        print(f"{n}-Queens: no solution found")
+                else:
+                    print(f"{n}-Queens: AC-3 found inconsistency")
+            else:
+                pairs = csp_fizzbuzz_range(args.start, args.stop)
+                print(f"AC-3 FizzBuzz classification [{args.start}..{args.stop}]:")
+                for n_val, lbl in pairs:
+                    print(f"  {n_val:>4}  {lbl!r}")
+
+        case "fenwick":
+            rule = RuleRegistry().get(args.rule)
+            trees = build_fizzbuzz_fenwick(rule, args.start, args.stop)
+            q_at = args.query_at if args.query_at is not None else (args.start + args.stop) // 2
+            counts_fw = fenwick_rank_query(trees, args.start, args.start, q_at)
+            print(f"Fenwick trees over [{args.start}..{args.stop}] rule={args.rule!r}:")
+            print(f"  Prefix counts [{args.start}..{q_at}]: {counts_fw}")
+            totals_fw = {lbl: t.total() for lbl, t in trees.items()}
+            print(f"  Totals [{args.start}..{args.stop}]: {totals_fw}")
+            # find_kth for each label
+            for lbl, t in sorted(trees.items()):
+                if t.total() >= 1:
+                    k1 = t.find_kth(1)
+                    print(f"  First {lbl!r:<10} at offset {k1} → n={args.start + k1 - 1}")
+
+        case "pheap":
+            rule = RuleRegistry().get(args.rule)
+            scheduled = fizzbuzz_priority_queue(rule, args.start, args.stop)
+            print(f"Pairing heap schedule [{args.start}..{args.stop}] "
+                  f"(FizzBuzz first, then Fizz, Buzz, plain):")
+            prev_pri = -1
+            for n_val, lbl in scheduled:
+                pri = _LABEL_PRIORITY.get(lbl, 3)
+                if pri != prev_pri:
+                    print(f"  --- priority {pri}: {lbl!r} ---")
+                    prev_pri = pri
+                print(f"    {n_val:>4}  {lbl!r}")
+            # Merge demo
+            merged = fizzbuzz_merge_schedule(rule, args.start, args.stop, args.workers)
+            print(f"\n  Merged ({args.workers} shards): first 5 = "
+                  f"{[(n, l) for n, l in merged[:5]]}")
+
+        case "fstream":
+            rule = RuleRegistry().get(args.rule)
+            match args.mode:
+                case "labelled":
+                    out = fizzbuzz_fused_pipeline(rule, args.start, args.stop)
+                    print(f"Fused stream — labelled [{args.start}..{args.stop}]:")
+                    for ln in out[:30]:
+                        print(f"  {ln}")
+                    if len(out) > 30:
+                        print(f"  … ({len(out)-30} more)")
+                    print(f"\n  Total labelled: {len(out)} / {args.stop - args.start + 1}")
+                case "scan":
+                    snapshots = fizzbuzz_scan_counts(rule, args.start, args.stop)
+                    # print every 15th snapshot
+                    step = max(1, len(snapshots) // 10)
+                    print(f"Running counts (every {step} steps):")
+                    for i in range(0, len(snapshots), step):
+                        print(f"  n={args.start + i:>4}  {snapshots[i]}")
+                    print(f"  final:  {snapshots[-1]}")
+                case "zip":
+                    s1 = stream_range(args.start, args.stop).map(lambda n: (n, rule(Number(n))))
+                    s2 = stream_range(args.start + 1, args.stop + 1).map(lambda n: (n, rule(Number(n))))
+                    zipped = s1.zip_with(s2, lambda a, b: (a, b)).take(10).run()
+                    print(f"Zipped consecutive pairs (first 10):")
+                    for a, b in zipped:
+                        print(f"  {a}  |  {b}")
 
         case "nbe":
             nf1, nf2 = nbe_fizzbuzz_demo(args.n)
