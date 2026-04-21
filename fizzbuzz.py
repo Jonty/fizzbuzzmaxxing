@@ -1470,6 +1470,262 @@ def _coalg_scale(factor: int) -> Callable[["VisitableRule"], RuleF["VisitableRul
 
 
 # ===========================================================================
+# § 2i  SECD abstract machine  (Stack / Environment / Control / Dump)
+# ===========================================================================
+# The SECD machine (Landin, 1964) is the original abstract machine for the
+# lambda calculus.  Four registers:
+#   S  – operand Stack
+#   E  – Environment (name → value bindings)
+#   C  – Control sequence (instruction list)
+#   D  – Dump (saved (S,E,C) frames for returning from function calls)
+#
+# We implement a small expression language:
+#   EConst(v)          – literal value
+#   EVar(x)            – variable reference
+#   ELam(p, body)      – lambda abstraction
+#   EApp(fn, arg)      – function application
+#   EIf(cond, t, e)    – conditional
+#   EBinOp(op, l, r)   – arithmetic/comparison primitive
+#   ELet(x, v, body)   – local binding (sugar for EApp(ELam(x,body), v))
+#   EFizzBuzz()        – lifted FizzBuzz rule as a primitive λn.rule(n)
+#
+# Compiled to a bytecode:
+#   I_Lit(v)           – push literal
+#   I_Lkp(x)           – environment lookup
+#   I_Clos(p, code)    – build closure
+#   I_App              – apply closure
+#   I_Ret              – return from call frame
+#   I_Sel(tc, fc)      – conditional dispatch (saves current C to dump)
+#   I_Join             – end of conditional branch (restores C from dump)
+#   I_Prim(name)       – built-in operation
+
+@dataclasses.dataclass(frozen=True)
+class EConst:
+    val: Any
+
+@dataclasses.dataclass(frozen=True)
+class EVar:
+    name: str
+
+@dataclasses.dataclass(frozen=True)
+class ELam:
+    param: str
+    body: Any  # SECDExpr
+
+@dataclasses.dataclass(frozen=True)
+class EApp:
+    fn: Any
+    arg: Any
+
+@dataclasses.dataclass(frozen=True)
+class EIf:
+    cond: Any
+    then_: Any
+    else_: Any
+
+@dataclasses.dataclass(frozen=True)
+class EBinOp:
+    op: str   # "add" "sub" "mul" "mod" "eq" "lt" "and" "or"
+    left: Any
+    right: Any
+
+@dataclasses.dataclass(frozen=True)
+class ELet:
+    var: str
+    val: Any
+    body: Any
+
+@dataclasses.dataclass(frozen=True)
+class EFizzBuzz:
+    """Produces the rule as a primitive: applied to int n, returns the label."""
+
+
+# Bytecode instruction types
+@dataclasses.dataclass(frozen=True)
+class I_Lit:
+    val: Any
+
+@dataclasses.dataclass(frozen=True)
+class I_Lkp:
+    name: str
+
+@dataclasses.dataclass(frozen=True)
+class I_Clos:
+    param: str
+    code: tuple  # tuple[SECDInstr, ...]
+
+@dataclasses.dataclass(frozen=True)
+class I_App:
+    pass
+
+@dataclasses.dataclass(frozen=True)
+class I_Ret:
+    pass
+
+@dataclasses.dataclass(frozen=True)
+class I_Sel:
+    then_code: tuple
+    else_code: tuple
+
+@dataclasses.dataclass(frozen=True)
+class I_Join:
+    pass
+
+@dataclasses.dataclass(frozen=True)
+class I_Prim:
+    name: str
+
+@dataclasses.dataclass(frozen=True)
+class I_FizzBuzz:
+    """Push the fizzbuzz rule as a callable value (rule is injected at run time)."""
+
+
+@dataclasses.dataclass
+class SECDClosure:
+    """First-class closure: a parameter name, body code, and captured environment."""
+    param: str
+    code: tuple
+    env: dict[str, Any]
+
+
+def secd_compile(expr: Any) -> list:
+    """Compile a mini-lambda expression to a flat SECD instruction list."""
+    match expr:
+        case EConst(val=v):
+            return [I_Lit(v)]
+        case EVar(name=x):
+            return [I_Lkp(x)]
+        case ELam(param=p, body=b):
+            body_code = secd_compile(b) + [I_Ret()]
+            return [I_Clos(p, tuple(body_code))]
+        case EApp(fn=f, arg=a):
+            return secd_compile(f) + secd_compile(a) + [I_App()]
+        case EIf(cond=c, then_=t, else_=e):
+            tc = tuple(secd_compile(t) + [I_Join()])
+            fc = tuple(secd_compile(e) + [I_Join()])
+            return secd_compile(c) + [I_Sel(tc, fc)]
+        case EBinOp(op=op, left=l, right=r):
+            return secd_compile(l) + secd_compile(r) + [I_Prim(op)]
+        case ELet(var=x, val=v, body=b):
+            # Sugar: ELet(x,v,b) ≡ EApp(ELam(x,b), v)
+            return secd_compile(EApp(ELam(x, b), v))
+        case EFizzBuzz():
+            return [I_FizzBuzz()]
+        case _:
+            raise TypeError(f"secd_compile: unknown expr {expr!r}")
+
+
+def secd_run(code: list, initial_env: dict[str, Any], fizzbuzz_rule: Any) -> Any:
+    """Execute SECD bytecode; returns the top of the final stack."""
+    S: list[Any] = []
+    E: dict[str, Any] = dict(initial_env)
+    C: list[Any] = list(code)
+    D: list[tuple] = []   # (S_saved, E_saved, C_saved, frame_kind)
+
+    def _prim(name: str) -> None:
+        match name:
+            case "add":      b = S.pop(); a = S.pop(); S.append(a + b)
+            case "sub":      b = S.pop(); a = S.pop(); S.append(a - b)
+            case "mul":      b = S.pop(); a = S.pop(); S.append(a * b)
+            case "mod":      b = S.pop(); a = S.pop(); S.append(a % b)
+            case "eq":       b = S.pop(); a = S.pop(); S.append(a == b)
+            case "lt":       b = S.pop(); a = S.pop(); S.append(a < b)
+            case "and":      b = S.pop(); a = S.pop(); S.append(bool(a) and bool(b))
+            case "or":       b = S.pop(); a = S.pop(); S.append(bool(a) or bool(b))
+            case _:
+                raise ValueError(f"Unknown primitive {name!r}")
+
+    MAX_STEPS = 200_000
+    for _ in range(MAX_STEPS):
+        if not C:
+            if not D:
+                break
+            ret_val = S[-1] if S else None
+            S_sv, E_sv, C_sv, _kind = D.pop()
+            S = S_sv + [ret_val]
+            E = E_sv
+            C = C_sv
+            continue
+
+        instr = C.pop(0)
+        match instr:
+            case I_Lit(val=v):
+                S.append(v)
+            case I_Lkp(name=x):
+                S.append(E[x])
+            case I_Clos(param=p, code=body):
+                S.append(SECDClosure(p, body, dict(E)))
+            case I_App():
+                arg = S.pop()
+                fn  = S.pop()
+                if isinstance(fn, SECDClosure):
+                    D.append((list(S), dict(E), list(C), "call"))
+                    S = []
+                    E = {**fn.env, fn.param: arg}
+                    C = list(fn.code)
+                elif callable(fn):
+                    S.append(fn(arg))
+                else:
+                    raise TypeError(f"Cannot apply {fn!r}")
+            case I_Ret():
+                ret_val = S[-1] if S else None
+                S_sv, E_sv, C_sv, _k = D.pop()
+                S = S_sv + [ret_val]
+                E = E_sv
+                C = C_sv
+            case I_Sel(then_code=tc, else_code=fc):
+                cond = S.pop()
+                D.append((list(S), dict(E), list(C), "join"))
+                S = []
+                C = list(tc if cond else fc)
+            case I_Join():
+                ret_val = S[-1] if S else None
+                S_sv, E_sv, C_sv, _k = D.pop()
+                S = S_sv + [ret_val]
+                E = E_sv
+                C = C_sv
+            case I_Prim(name=nm):
+                _prim(nm)
+            case I_FizzBuzz():
+                # Push the rule as a Python callable; I_App will invoke it
+                S.append(lambda n: fizzbuzz_rule(Number(int(n))))
+    else:
+        raise RuntimeError("SECD: step limit exceeded")
+
+    return S[-1] if S else None
+
+
+def secd_eval(expr: Any, rule: Any, env: dict[str, Any] | None = None) -> Any:
+    return secd_run(secd_compile(expr), env or {}, rule)
+
+
+def secd_fizzbuzz_range(rule: Any, start: int, stop: int) -> dict[int, Any]:
+    """Run [start,stop] through the SECD machine one expression per n."""
+    fb = EFizzBuzz()
+    return {n: secd_eval(EApp(fb, EConst(n)), rule) for n in range(start, stop + 1)}
+
+
+def secd_demo_program(n_val: int) -> Any:
+    """
+    Higher-order SECD demo:
+      let compose = λf. λg. λx. f (g x)
+      let fizz3   = λn. (n mod 3) == 0
+      let buzz5   = λn. (n mod 5) == 0
+      let fizzy   = compose (λt. if t then "Fizz" else "") fizz3
+      fizzy <n_val>
+    (Uses ELet, ELam, EApp, EBinOp, EIf — exercises the full instruction set.)
+    """
+    compose = ELam("f", ELam("g", ELam("x", EApp(EVar("f"), EApp(EVar("g"), EVar("x"))))))
+    fizz3   = ELam("n", EBinOp("eq", EBinOp("mod", EVar("n"), EConst(3)), EConst(0)))
+    wrap    = ELam("t", EIf(EVar("t"), EConst("Fizz"), EConst("")))
+    fizzy   = EApp(EApp(EVar("compose"), wrap), EVar("fizz3"))
+    return ELet("compose", compose,
+           ELet("fizz3", fizz3,
+           ELet("fizzy", fizzy,
+                EApp(EVar("fizzy"), EConst(n_val)))))
+
+
+# ===========================================================================
 # § 3  Event bus
 # ===========================================================================
 
@@ -2701,6 +2957,174 @@ def check_rule_mutual_exclusion(rule: "VisitableRule", start: int = 1, stop: int
         else:
             results.append(f"  n={n_val:>3}  fires={actual_fires}  prop={grounded!r}  ✓")
     return results
+
+
+# ===========================================================================
+# § 6f  First-order unification  (Robinson's MGU algorithm)
+# ===========================================================================
+# Unification is the core of Prolog, ML type inference, and many constraint
+# solvers.  Given two *type terms* t1 and t2, we find the Most General
+# Unifier (MGU) — the smallest substitution σ such that σ(t1) = σ(t2).
+#
+# Term grammar:
+#   TVar(name)        – type variable (unifiable)
+#   TConst(name)      – atomic constant (only unifies with same constant)
+#   TApp(head, args)  – structured term / type constructor application
+#
+# Robinson's algorithm (1965):
+#   unify(t1, t2, subst):
+#     if t1 == t2:          return subst
+#     if TVar(x) = t1:      occurs-check, then extend subst with x ↦ t2
+#     if TVar(x) = t2:      symmetric
+#     if TApp(h,a) = both:  unify heads, then zip-unify args
+#     else:                 fail
+#
+# We apply it to FizzBuzz rule modelling: each DivisibilityRule becomes a
+# type term, and we can unify rule "shapes" to find structural commonalities.
+
+@dataclasses.dataclass(frozen=True)
+class TVar:
+    name: str
+
+    def __repr__(self) -> str:
+        return f"?{self.name}"
+
+@dataclasses.dataclass(frozen=True)
+class TConst:
+    name: str
+
+    def __repr__(self) -> str:
+        return self.name
+
+@dataclasses.dataclass(frozen=True)
+class TApp:
+    head: str
+    args: tuple  # tuple[UnifyTerm, ...]
+
+    def __repr__(self) -> str:
+        if self.args:
+            return f"{self.head}({', '.join(repr(a) for a in self.args)})"
+        return self.head
+
+UnifyTerm: TypeAlias = Union[TVar, TConst, TApp]
+Subst: TypeAlias = dict[str, UnifyTerm]
+
+
+def _apply_subst(subst: Subst, t: UnifyTerm) -> UnifyTerm:
+    """Recursively chase variable chains and substitute."""
+    match t:
+        case TVar(name=x):
+            if x in subst:
+                return _apply_subst(subst, subst[x])
+            return t
+        case TConst():
+            return t
+        case TApp(head=h, args=args):
+            return TApp(h, tuple(_apply_subst(subst, a) for a in args))
+
+
+def _occurs(var: str, t: UnifyTerm, subst: Subst) -> bool:
+    """Occurs check: does TVar(var) appear free in t under subst?"""
+    t = _apply_subst(subst, t)
+    match t:
+        case TVar(name=x):
+            return x == var
+        case TConst():
+            return False
+        case TApp(args=args):
+            return any(_occurs(var, a, subst) for a in args)
+
+
+def unify(t1: UnifyTerm, t2: UnifyTerm,
+          subst: Subst | None = None) -> "Result[Subst, str]":
+    """Robinson's unification algorithm.  Returns Ok(MGU) or Err(reason)."""
+    subst = dict(subst or {})
+    stack: list[tuple[UnifyTerm, UnifyTerm]] = [(t1, t2)]
+    while stack:
+        s, t = stack.pop()
+        s = _apply_subst(subst, s)
+        t = _apply_subst(subst, t)
+        if s == t:
+            continue
+        match (s, t):
+            case (TVar(name=x), _):
+                if _occurs(x, t, subst):
+                    return Err(f"Occurs check failed: ?{x} in {t!r}")
+                subst[x] = t
+            case (_, TVar(name=y)):
+                if _occurs(y, s, subst):
+                    return Err(f"Occurs check failed: ?{y} in {s!r}")
+                subst[y] = s
+            case (TApp(head=h1, args=a1), TApp(head=h2, args=a2)):
+                if h1 != h2:
+                    return Err(f"Clash: {h1!r} vs {h2!r}")
+                if len(a1) != len(a2):
+                    return Err(f"Arity mismatch: {h1}/{len(a1)} vs {h2}/{len(a2)}")
+                stack.extend(zip(a1, a2))
+            case _:
+                return Err(f"Cannot unify {s!r} and {t!r}")
+    return Ok(subst)
+
+
+def _rule_to_term(rule: Any) -> UnifyTerm:
+    """Convert a FizzBuzz rule tree to a unifiable term."""
+    from typing import get_type_hints
+    # We import inside to avoid forward-reference issues; rule classes defined in § 7
+    cls_name = type(rule).__name__
+    match cls_name:
+        case "DivisibilityRule":
+            return TApp("div", (TConst(str(rule.divisor)), TConst(rule.label or "_")))
+        case "CompositeRule":
+            return TApp("composite", tuple(_rule_to_term(r) for r in rule.rules))
+        case "NullRule":
+            return TConst("null")
+        case _:
+            return TApp(cls_name.lower(), ())
+
+
+def _term_to_pattern(term: UnifyTerm) -> str:
+    """Pretty-print a term with variable wildcards."""
+    return repr(term)
+
+
+def unify_rules(r1: Any, r2: Any) -> "Result[Subst, str]":
+    """Unify two FizzBuzz rules as structural terms."""
+    return unify(_rule_to_term(r1), _rule_to_term(r2))
+
+
+def find_rule_mgu(rule_names: list[str]) -> "Result[tuple[Subst, list[str]], str]":
+    """Find the pairwise MGU across a list of named rules, reporting commonalities."""
+    results: list[str] = []
+    combined_subst: Subst = {}
+
+    def _get_reg():
+        return RuleRegistry()
+
+    reg = _get_reg()
+    terms = [(name, _rule_to_term(reg.get(name))) for name in rule_names]
+    results.append("Rule terms:")
+    for name, term in terms:
+        results.append(f"  {name:<20} {term!r}")
+
+    results.append("\nPairwise unification:")
+    for i, (n1, t1) in enumerate(terms):
+        for n2, t2 in terms[i + 1:]:
+            # Rename variables in t2 to avoid accidental capture
+            def _fresh(term: UnifyTerm, suffix: str) -> UnifyTerm:
+                match term:
+                    case TVar(name=x):    return TVar(x + suffix)
+                    case TConst():        return term
+                    case TApp(head=h, args=a): return TApp(h, tuple(_fresh(x, suffix) for x in a))
+            t2r = _fresh(t2, f"_{n2}")
+            res = unify(t1, t2r)
+            if res.is_ok():
+                mgu = res.unwrap()
+                results.append(f"  {n1} ↔ {n2}: MGU has {len(mgu)} binding(s)  ✓")
+                for var, val in list(mgu.items())[:3]:
+                    results.append(f"    ?{var} → {val!r}")
+            else:
+                results.append(f"  {n1} ↔ {n2}: no unifier — {res.error}")
+    return Ok((combined_subst, results))
 
 
 # ===========================================================================
@@ -4016,6 +4440,164 @@ def cms_fizzbuzz(
         label = rule(Number(n)) or str(n)
         cms.add(label)
     return cms
+
+
+# ===========================================================================
+# § 10e  Skip list  (probabilistic O(log n) ordered map)
+# ===========================================================================
+# A skip list (Pugh, 1990) is a randomised data structure that achieves
+# O(log n) expected time for insert, search, and delete without the
+# rotational complexity of balanced trees.
+#
+# Structure: a layered linked list.  The bottom layer (level 0) contains all
+# elements in sorted order.  Each higher layer is a "fast lane" that skips
+# over ~half the nodes of the layer below (governed by a coin-flip of
+# probability p, typically 0.5).
+#
+# Search: start at the top-left (head, max_level-1), walk right until the
+# next key exceeds the target, then drop down one level, repeat.
+#
+# Insert: find the update[i] predecessor at each level, pick a random height
+# for the new node, link it in at each level up to that height.
+#
+# Delete: symmetric to insert — find predecessors, unlink.
+#
+# Range query: walk the level-0 lane between lo and hi keys.
+#
+# FizzBuzz application: index label → list of n values, supporting fast
+# range queries like "all n in [lo, hi] whose label is Fizz".
+
+import math as _math
+import random as _random
+
+
+@dataclasses.dataclass
+class _SLNode:
+    key: Any
+    value: Any
+    forward: list  # list of _SLNode | None, indexed by level
+
+
+_SL_SENTINEL = -_math.inf  # sentinel head key
+
+
+class SkipList:
+    """Ordered probabilistic map with O(log n) expected operations."""
+
+    def __init__(self, max_level: int = 16, p: float = 0.5) -> None:
+        self._max_level = max_level
+        self._p         = p
+        self._level     = 0
+        self._head      = _SLNode(_SL_SENTINEL, None, [None] * max_level)
+        self._size      = 0
+
+    # ── internal helpers ────────────────────────────────────────────────────
+
+    def _random_level(self) -> int:
+        lvl = 1
+        while _random.random() < self._p and lvl < self._max_level:
+            lvl += 1
+        return lvl
+
+    def _find_update(self, key: Any) -> list:
+        """Return the predecessor nodes at each level for the given key."""
+        update: list = [None] * self._max_level
+        cur = self._head
+        for i in range(max(self._level - 1, 0), -1, -1):
+            while cur.forward[i] is not None and cur.forward[i].key < key:
+                cur = cur.forward[i]
+            update[i] = cur
+        return update
+
+    # ── public API ──────────────────────────────────────────────────────────
+
+    def insert(self, key: Any, value: Any) -> None:
+        update = self._find_update(key)
+        cur = update[0].forward[0] if update[0] else None
+        if cur is not None and cur.key == key:
+            cur.value = value
+            return
+        new_lvl = self._random_level()
+        if new_lvl > self._level:
+            for i in range(self._level, new_lvl):
+                update[i] = self._head
+            self._level = new_lvl
+        node = _SLNode(key, value, [None] * self._max_level)
+        for i in range(new_lvl):
+            node.forward[i] = update[i].forward[i]
+            update[i].forward[i] = node
+        self._size += 1
+
+    def search(self, key: Any) -> "Result[Any, str]":
+        cur = self._head
+        for i in range(max(self._level - 1, 0), -1, -1):
+            while cur.forward[i] is not None and cur.forward[i].key < key:
+                cur = cur.forward[i]
+        cur = cur.forward[0]
+        if cur is not None and cur.key == key:
+            return Ok(cur.value)
+        return Err(f"key {key!r} not in skip list")
+
+    def delete(self, key: Any) -> bool:
+        update = self._find_update(key)
+        target = update[0].forward[0] if update[0] else None
+        if target is None or target.key != key:
+            return False
+        for i in range(self._level):
+            if update[i].forward[i] is not target:
+                break
+            update[i].forward[i] = target.forward[i]
+        while self._level > 1 and self._head.forward[self._level - 1] is None:
+            self._level -= 1
+        self._size -= 1
+        return True
+
+    def range_query(self, lo: Any, hi: Any) -> list[tuple[Any, Any]]:
+        """Return all (key, value) pairs with lo ≤ key ≤ hi, in order."""
+        cur = self._head
+        for i in range(max(self._level - 1, 0), -1, -1):
+            while cur.forward[i] is not None and cur.forward[i].key < lo:
+                cur = cur.forward[i]
+        cur = cur.forward[0]
+        results: list[tuple[Any, Any]] = []
+        while cur is not None and cur.key <= hi:
+            results.append((cur.key, cur.value))
+            cur = cur.forward[0]
+        return results
+
+    def to_sorted_list(self) -> list[tuple[Any, Any]]:
+        cur = self._head.forward[0]
+        out: list = []
+        while cur is not None:
+            out.append((cur.key, cur.value))
+            cur = cur.forward[0]
+        return out
+
+    def __len__(self) -> int:
+        return self._size
+
+    def __repr__(self) -> str:
+        return f"SkipList(size={self._size}, levels={self._level})"
+
+
+def build_label_skip_list(rule: Any, start: int, stop: int) -> SkipList:
+    """Insert each n → label into a SkipList, keyed by n."""
+    sl = SkipList()
+    for n in range(start, stop + 1):
+        label = rule(Number(n)) or str(n)
+        sl.insert(n, label)
+    return sl
+
+
+def skip_list_label_index(rule: Any, start: int, stop: int) -> dict[str, SkipList]:
+    """Build an inverted index: label → SkipList of n values that bear it."""
+    index: dict[str, SkipList] = {}
+    for n in range(start, stop + 1):
+        label = rule(Number(n)) or str(n)
+        if label not in index:
+            index[label] = SkipList()
+        index[label].insert(n, n)
+    return index
 
 
 # ===========================================================================
@@ -5485,6 +6067,332 @@ def fizzbuzz_run_detector(rule: "VisitableRule", start: int = 1, stop: int = 30)
         if v_prev == v_cur:
             pairs.append((t_cur, (v_prev, v_cur)))
     return Event(tuple(pairs))
+
+
+# ===========================================================================
+# § 13i  Finger tree  (Hinze & Paterson, 2006)
+# ===========================================================================
+# A finger tree is a purely functional sequence with amortised O(1) push/pop
+# at both ends and O(log n) split, concatenation, and random access.  The key
+# idea is a *measured* 2-3 tree with *digits* (1–4 elements) at the fingers.
+#
+#   FTEmpty           – the empty sequence
+#   FTSingle(val)     – exactly one element
+#   FTDeep(pre,mid,suf,sz)
+#     pre  – left digit: 1..4 elements
+#     mid  – recursive FingerTree of 2/3-node bundles
+#     suf  – right digit: 1..4 elements
+#     sz   – cached total element count (the *measure*)
+#
+# Nodes (used inside mid):
+#   FTNode2(a, b, sz)
+#   FTNode3(a, b, c, sz)
+#
+# Operations:
+#   ft_push_l / ft_push_r   – O(1) amortised
+#   ft_pop_l  / ft_pop_r    – O(1) amortised (returns head and tail)
+#   ft_concat               – O(log n)
+#   ft_split_at             – O(log n) split at position i
+#   ft_index                – O(log n) random access
+#   ft_from_iter / ft_to_list
+
+
+@dataclasses.dataclass(frozen=True)
+class FTEmpty:
+    pass
+
+@dataclasses.dataclass(frozen=True)
+class FTSingle:
+    val: Any
+
+@dataclasses.dataclass(frozen=True)
+class FTNode2:
+    a: Any
+    b: Any
+    sz: int
+
+@dataclasses.dataclass(frozen=True)
+class FTNode3:
+    a: Any
+    b: Any
+    c: Any
+    sz: int
+
+@dataclasses.dataclass(frozen=True)
+class FTDeep:
+    pre: tuple   # 1..4 elements or nodes
+    mid: Any     # FingerTree of nodes
+    suf: tuple   # 1..4 elements or nodes
+    sz: int
+
+FingerTree: TypeAlias = Union[FTEmpty, FTSingle, FTDeep]
+
+
+def _esz(elem: Any) -> int:
+    """Measure: size of a single element (1 for leaves, .sz for nodes)."""
+    if isinstance(elem, (FTNode2, FTNode3)):
+        return elem.sz
+    return 1
+
+
+def _ftsz(t: FingerTree) -> int:
+    match t:
+        case FTEmpty():      return 0
+        case FTSingle(val=v): return _esz(v)
+        case FTDeep(sz=s):   return s
+
+
+def _mk2(a: Any, b: Any) -> FTNode2:
+    return FTNode2(a, b, _esz(a) + _esz(b))
+
+
+def _mk3(a: Any, b: Any, c: Any) -> FTNode3:
+    return FTNode3(a, b, c, _esz(a) + _esz(b) + _esz(c))
+
+
+def _node_elems(n: Any) -> tuple:
+    match n:
+        case FTNode2(a=a, b=b):       return (a, b)
+        case FTNode3(a=a, b=b, c=c):  return (a, b, c)
+        case _:                        return (n,)
+
+
+def _deep(pre: tuple, mid: FingerTree, suf: tuple) -> FingerTree:
+    sz = sum(_esz(e) for e in pre) + _ftsz(mid) + sum(_esz(e) for e in suf)
+    return FTDeep(pre, mid, suf, sz)
+
+
+# ── push ────────────────────────────────────────────────────────────────────
+
+def ft_push_l(a: Any, t: FingerTree) -> FingerTree:
+    match t:
+        case FTEmpty():
+            return FTSingle(a)
+        case FTSingle(val=b):
+            return _deep((a,), FTEmpty(), (b,))
+        case FTDeep(pre=pre, mid=mid, suf=suf, sz=sz):
+            new_sz = sz + _esz(a)
+            if len(pre) < 4:
+                return FTDeep((a,) + pre, mid, suf, new_sz)
+            # Overflow: pack pre[1..3] into a node, push to mid
+            overflow = _mk3(pre[1], pre[2], pre[3])
+            return FTDeep((a, pre[0]), ft_push_l(overflow, mid), suf, new_sz)
+
+
+def ft_push_r(t: FingerTree, a: Any) -> FingerTree:
+    match t:
+        case FTEmpty():
+            return FTSingle(a)
+        case FTSingle(val=b):
+            return _deep((b,), FTEmpty(), (a,))
+        case FTDeep(pre=pre, mid=mid, suf=suf, sz=sz):
+            new_sz = sz + _esz(a)
+            if len(suf) < 4:
+                return FTDeep(pre, mid, suf + (a,), new_sz)
+            overflow = _mk3(suf[0], suf[1], suf[2])
+            return FTDeep(pre, ft_push_r(mid, overflow), (suf[3], a), new_sz)
+
+
+# ── view / pop ──────────────────────────────────────────────────────────────
+
+def _deep_l(pre: tuple, mid: FingerTree, suf: tuple) -> FingerTree:
+    """Reconstruct a Deep when pre might be empty after a pop."""
+    if pre:
+        return _deep(pre, mid, suf)
+    match mid:
+        case FTEmpty():
+            if not suf:
+                return FTEmpty()
+            if len(suf) == 1:
+                return FTSingle(suf[0])
+            return _deep(suf[:1], FTEmpty(), suf[1:])
+        case _:
+            head, rest = ft_pop_l(mid)
+            return _deep(_node_elems(head), rest, suf)
+
+
+def _deep_r(pre: tuple, mid: FingerTree, suf: tuple) -> FingerTree:
+    if suf:
+        return _deep(pre, mid, suf)
+    match mid:
+        case FTEmpty():
+            if not pre:
+                return FTEmpty()
+            if len(pre) == 1:
+                return FTSingle(pre[0])
+            return _deep(pre[:-1], FTEmpty(), pre[-1:])
+        case _:
+            rest, last = ft_pop_r(mid)
+            return _deep(pre, rest, _node_elems(last))
+
+
+def ft_pop_l(t: FingerTree) -> tuple[Any, FingerTree]:
+    """Return (head_element, tail_tree)."""
+    match t:
+        case FTEmpty():
+            raise IndexError("ft_pop_l: empty tree")
+        case FTSingle(val=v):
+            return v, FTEmpty()
+        case FTDeep(pre=pre, mid=mid, suf=suf):
+            return pre[0], _deep_l(pre[1:], mid, suf)
+
+
+def ft_pop_r(t: FingerTree) -> tuple[FingerTree, Any]:
+    """Return (init_tree, last_element)."""
+    match t:
+        case FTEmpty():
+            raise IndexError("ft_pop_r: empty tree")
+        case FTSingle(val=v):
+            return FTEmpty(), v
+        case FTDeep(pre=pre, mid=mid, suf=suf):
+            return _deep_r(pre, mid, suf[:-1]), suf[-1]
+
+
+# ── concatenation ────────────────────────────────────────────────────────────
+
+def _nodes_from_digits(elems: list) -> list:
+    """Pack a list of elements into 2- and 3-nodes, left-to-right."""
+    nodes = []
+    while len(elems) >= 5:
+        nodes.append(_mk3(elems[0], elems[1], elems[2]))
+        elems = elems[3:]
+    match len(elems):
+        case 2: nodes.append(_mk2(elems[0], elems[1]))
+        case 3: nodes.append(_mk3(elems[0], elems[1], elems[2]))
+        case 4:
+            nodes.append(_mk2(elems[0], elems[1]))
+            nodes.append(_mk2(elems[2], elems[3]))
+    return nodes
+
+
+def _app3(t1: FingerTree, mid_elems: list, t2: FingerTree) -> FingerTree:
+    """Concatenate t1 + mid_elems + t2 (internal helper for ft_concat)."""
+    match (t1, t2):
+        case (FTEmpty(), _):
+            t = t2
+            for e in reversed(mid_elems):
+                t = ft_push_l(e, t)
+            return t
+        case (_, FTEmpty()):
+            t = t1
+            for e in mid_elems:
+                t = ft_push_r(t, e)
+            return t
+        case (FTSingle(val=v), _):
+            t = _app3(FTEmpty(), mid_elems, t2)
+            return ft_push_l(v, t)
+        case (_, FTSingle(val=v)):
+            t = _app3(t1, mid_elems, FTEmpty())
+            return ft_push_r(t, v)
+        case (FTDeep(pre=p1, mid=m1, suf=s1), FTDeep(pre=p2, mid=m2, suf=s2)):
+            inner = list(s1) + mid_elems + list(p2)
+            new_mid = _app3(m1, _nodes_from_digits(inner), m2)
+            return _deep(p1, new_mid, s2)
+
+
+def ft_concat(t1: FingerTree, t2: FingerTree) -> FingerTree:
+    return _app3(t1, [], t2)
+
+
+# ── split & index ─────────────────────────────────────────────────────────
+
+def _split_digit(i: int, digit: tuple) -> tuple[tuple, Any, tuple]:
+    """Split digit at accumulated position i; return (left, pivot, right)."""
+    acc = 0
+    for idx, elem in enumerate(digit):
+        acc += _esz(elem)
+        if acc > i:
+            return digit[:idx], elem, digit[idx + 1:]
+    raise IndexError(f"split_digit: i={i} out of range in {digit!r}")
+
+
+def _split_tree(i: int, t: FingerTree) -> tuple[FingerTree, Any, FingerTree]:
+    """Split t at position i; returns (left_tree, pivot_element, right_tree)."""
+    match t:
+        case FTSingle(val=v):
+            return FTEmpty(), v, FTEmpty()
+        case FTDeep(pre=pre, mid=mid, suf=suf):
+            pre_sz = sum(_esz(e) for e in pre)
+            mid_sz = _ftsz(mid)
+            if i < pre_sz:
+                left_d, piv, right_d = _split_digit(i, pre)
+                return (ft_from_iter(left_d),
+                        piv,
+                        _deep_l(right_d + tuple(_node_elems(e) if isinstance(e, (FTNode2, FTNode3)) else (e,) for e in ()) , mid, suf)
+                        if False else _deep_l(right_d, mid, suf))
+            elif i < pre_sz + mid_sz:
+                ml, mp, mr = _split_tree(i - pre_sz, mid)
+                mp_elems = _node_elems(mp)
+                mp_sz = sum(_esz(x) for x in mp_elems[:i - pre_sz - _ftsz(ml)])
+                left_d, piv, right_d = _split_digit(i - pre_sz - _ftsz(ml), mp_elems)
+                return (_deep_r(pre, ml, left_d),
+                        piv,
+                        _deep_l(right_d, mr, suf))
+            else:
+                left_d, piv, right_d = _split_digit(i - pre_sz - mid_sz, suf)
+                return (_deep_r(pre, mid, left_d), piv, ft_from_iter(right_d))
+        case _:
+            raise IndexError("split_tree on empty tree")
+
+
+def ft_split_at(i: int, t: FingerTree) -> tuple[FingerTree, FingerTree]:
+    """Split t into (t[:i], t[i:])."""
+    if i <= 0:
+        return FTEmpty(), t
+    if i >= _ftsz(t):
+        return t, FTEmpty()
+    left, pivot, right = _split_tree(i, t)
+    return left, ft_push_l(pivot, right)
+
+
+def ft_index(i: int, t: FingerTree) -> Any:
+    """O(log n) indexed access."""
+    if i < 0 or i >= _ftsz(t):
+        raise IndexError(f"ft_index: {i} out of range [0, {_ftsz(t)})")
+    _, pivot, _ = _split_tree(i, t)
+    # pivot may be a node — drill down to the leaf
+    while isinstance(pivot, (FTNode2, FTNode3)):
+        elems = _node_elems(pivot)
+        for e in elems:
+            if _esz(e) > i:
+                pivot = e
+                break
+            i -= _esz(e)
+    return pivot
+
+
+# ── bulk construction / destruction ──────────────────────────────────────────
+
+def ft_from_iter(it: Any) -> FingerTree:
+    t: FingerTree = FTEmpty()
+    for elem in it:
+        t = ft_push_r(t, elem)
+    return t
+
+
+def ft_to_list(t: FingerTree) -> list:
+    match t:
+        case FTEmpty():
+            return []
+        case FTSingle(val=v):
+            return list(_node_elems(v)) if isinstance(v, (FTNode2, FTNode3)) else [v]
+        case FTDeep(pre=pre, mid=mid, suf=suf):
+            result = []
+            for e in pre:
+                result.extend(_node_elems(e) if isinstance(e, (FTNode2, FTNode3)) else [e])
+            for e in ft_to_list(mid):
+                result.extend(_node_elems(e) if isinstance(e, (FTNode2, FTNode3)) else [e])
+            for e in suf:
+                result.extend(_node_elems(e) if isinstance(e, (FTNode2, FTNode3)) else [e])
+            return result
+
+
+# ── FizzBuzz domain integration ───────────────────────────────────────────────
+
+def fizzbuzz_finger_tree(rule: Any, start: int, stop: int) -> FingerTree:
+    """Build a finger tree of (n, label) pairs for [start, stop]."""
+    pairs = [(n, rule(Number(n)) or str(n)) for n in range(start, stop + 1)]
+    return ft_from_iter(pairs)
 
 
 # ===========================================================================
@@ -7062,6 +7970,223 @@ def run_green_fizzbuzz(
 
 
 # ===========================================================================
+# § 19h  Algebraic effect handlers  (free-monad / open-union approach)
+# ===========================================================================
+# Algebraic effects (Plotkin & Power, 2001; Plotkin & Pretnar, 2009) generalise
+# exceptions, state, I/O, and non-determinism into a uniform framework.
+#
+# This implementation uses a *free monad over an open union of effect types*:
+#
+#   Eff[A] = Pure(a)              — return value a
+#           | Do(effect, k)       — perform effect, then call continuation k
+#
+#   perform(eff) → Do(eff, Pure)  — single-step effect
+#   bind(m, f)                    — sequence two effectful computations
+#   run(handler, m)               — interpret m with handler
+#
+# A Handler is a record of:
+#   return_clause: A → R          — lifts a pure value to result type R
+#   effect_clauses: dict[type, (effect, k) → R]
+#
+# *Deep handlers* (default): after handling an effect Op(e, k), the
+#   continuation k is run UNDER the same handler (handler is re-installed).
+# *Shallow handlers*: after handling Op(e, k), k runs WITHOUT the handler
+#   (the handler fires at most once).
+#
+# FizzBuzz effects:
+#   XEmit(n, label) — emit an (n, label) pair to the output channel
+#   XGetRule        — ask for the current rule (answered by the handler)
+#   XLog(msg)       — log a diagnostic message
+
+@dataclasses.dataclass(frozen=True)
+class _EffPure(Generic[T]):
+    value: T
+
+@dataclasses.dataclass
+class _EffDo(Generic[T]):
+    effect: Any   # some Effect subclass
+    continuation: Callable[[Any], "_Eff[T]"]  # answer → Eff[T]
+
+_Eff: TypeAlias = Union["_EffPure[T]", "_EffDo[T]"]
+
+
+# Effect descriptors (plain dataclasses — no behaviour, just data)
+
+@dataclasses.dataclass(frozen=True)
+class XEmit:
+    n: int
+    label: "LabelT"
+
+@dataclasses.dataclass(frozen=True)
+class XGetRule:
+    pass
+
+@dataclasses.dataclass(frozen=True)
+class XLog:
+    message: str
+
+
+# ── smart constructors ────────────────────────────────────────────────────────
+
+def xpure(v: T) -> "_Eff[T]":
+    return _EffPure(v)
+
+def xperform(eff: Any) -> "_Eff[Any]":
+    """Lift a single effect into the Eff monad; the continuation is Pure."""
+    return _EffDo(eff, xpure)
+
+def xbind(m: "_Eff[A]", f: "Callable[[A], _Eff[B]]") -> "_Eff[B]":
+    """Monadic sequencing.  bind(Pure(a), f) = f(a); bind(Do(e,k), f) = Do(e, λv. bind(k(v), f))."""
+    match m:
+        case _EffPure(value=v):
+            return f(v)
+        case _EffDo(effect=eff, continuation=k):
+            return _EffDo(eff, lambda v: xbind(k(v), f))
+
+
+# ── handler dataclass ─────────────────────────────────────────────────────────
+
+@dataclasses.dataclass
+class XHandler:
+    """
+    An algebraic effect handler.
+
+    effect_clauses: {EffectType: fn(effect, resume_k) → result}
+    return_clause:  fn(value) → result
+    deep:           if True, re-install this handler over the continuation
+    """
+    effect_clauses: dict[type, Callable]
+    return_clause: Callable
+    deep: bool = True
+
+
+def xrun(handler: XHandler, m: "_Eff[Any]") -> Any:
+    """
+    Interpret m with handler.
+    Deep mode:   continuation is wrapped under the same handler.
+    Shallow mode: continuation is run WITHOUT the handler.
+    """
+    match m:
+        case _EffPure(value=v):
+            return handler.return_clause(v)
+        case _EffDo(effect=eff, continuation=k):
+            clause = handler.effect_clauses.get(type(eff))
+            if clause is None:
+                raise RuntimeError(
+                    f"Unhandled effect {type(eff).__name__!r}. "
+                    f"Handler only covers: {[t.__name__ for t in handler.effect_clauses]}"
+                )
+            if handler.deep:
+                # Deep: re-install handler for continuation
+                resume = lambda v: xrun(handler, k(v))
+            else:
+                # Shallow: continuation escapes the handler scope
+                resume = lambda v: k(v)
+            return clause(eff, resume)
+
+
+# ── FizzBuzz effectful program ────────────────────────────────────────────────
+
+def _xfb_program(rule: Any, start: int, stop: int) -> "_Eff[None]":
+    """Build the effectful FizzBuzz program as a pure Eff value."""
+    def _loop(n: int) -> "_Eff[None]":
+        if n > stop:
+            return xpure(None)
+        label = rule(Number(n))
+        emit = xperform(XEmit(n, label))
+        return xbind(emit, lambda _: _loop(n + 1))
+    return _loop(start)
+
+
+def _xfb_program_with_log(rule: Any, start: int, stop: int) -> "_Eff[None]":
+    """Same but also logs every FizzBuzz hit."""
+    def _loop(n: int) -> "_Eff[None]":
+        if n > stop:
+            return xpure(None)
+        label = rule(Number(n))
+        after_emit = xbind(xperform(XEmit(n, label)), lambda _: xpure(None))
+        if label:
+            after_log = xbind(
+                xperform(XLog(f"hit at n={n}: {label}")),
+                lambda _: after_emit,
+            )
+            return xbind(after_log, lambda _: _loop(n + 1))
+        return xbind(after_emit, lambda _: _loop(n + 1))
+    return _loop(start)
+
+
+# ── built-in handlers ─────────────────────────────────────────────────────────
+
+def _xhandler_collect() -> XHandler:
+    """Deep handler: collect all emitted (n, label) pairs into a list."""
+    buf: list[tuple[int, "LabelT"]] = []
+    def _h_emit(eff: XEmit, resume: Callable) -> list:
+        buf.append((eff.n, eff.label))
+        return resume(None)
+    return XHandler(
+        effect_clauses={XEmit: _h_emit, XLog: lambda e, k: k(None)},
+        return_clause=lambda _: list(buf),
+        deep=True,
+    )
+
+
+def _xhandler_count() -> XHandler:
+    """Deep handler: count occurrences of each label."""
+    counts: Counter[str] = Counter()
+    def _h_emit(eff: XEmit, resume: Callable) -> Counter:
+        counts[eff.label or str(eff.n)] += 1
+        return resume(None)
+    return XHandler(
+        effect_clauses={XEmit: _h_emit, XLog: lambda e, k: k(None)},
+        return_clause=lambda _: Counter(counts),
+        deep=True,
+    )
+
+
+def _xhandler_io(sink: "OutputSink") -> XHandler:
+    """Deep handler: write each emitted label to a sink."""
+    def _h_emit(eff: XEmit, resume: Callable) -> None:
+        sink.write(f"{eff.n}: {eff.label or eff.n}")
+        return resume(None)
+    def _h_log(eff: XLog, resume: Callable) -> None:
+        sink.write(f"[log] {eff.message}")
+        return resume(None)
+    return XHandler(
+        effect_clauses={XEmit: _h_emit, XLog: _h_log},
+        return_clause=lambda _: None,
+        deep=True,
+    )
+
+
+def _xhandler_shallow_first_hit() -> XHandler:
+    """Shallow handler: intercepts only the FIRST XEmit, then lets the rest run unhandled."""
+    def _h_emit(eff: XEmit, resume: Callable) -> tuple:
+        # Shallow — resume is the raw continuation, not wrapped in this handler
+        rest = resume(None)  # rest is now an _Eff value, not yet run
+        return (eff.n, eff.label), rest
+    return XHandler(
+        effect_clauses={XEmit: _h_emit},
+        return_clause=lambda v: (None, xpure(v)),
+        deep=False,
+    )
+
+
+def xfb_run_collect(rule: Any, start: int, stop: int) -> list[tuple[int, "LabelT"]]:
+    h = _xhandler_collect()
+    return xrun(h, _xfb_program(rule, start, stop))
+
+
+def xfb_run_count(rule: Any, start: int, stop: int) -> "Counter[str]":
+    h = _xhandler_count()
+    return xrun(h, _xfb_program(rule, start, stop))
+
+
+def xfb_run_io(rule: Any, start: int, stop: int, sink: "OutputSink") -> None:
+    h = _xhandler_io(sink)
+    xrun(h, _xfb_program(rule, start, stop))
+
+
+# ===========================================================================
 # § 20  Interactive REPL
 # ===========================================================================
 
@@ -7577,6 +8702,11 @@ def run_repl() -> None:
                     "  cms                          — Count-Min Sketch frequency estimation\n"
                     "  frp                          — arrowized FRP Behavior/Event network\n"
                     "  green                        — cooperative green-thread FizzBuzz\n"
+                    "  secd [n]                     — SECD abstract machine evaluation\n"
+                    "  unify [rule …]               — first-order unification (MGU) of rule terms\n"
+                    "  skiplist                     — skip list label index + range queries\n"
+                    "  ftree                        — finger tree sequence (split/concat/index)\n"
+                    "  xfx [collect|count|io]       — algebraic effect handlers\n"
                     "  quit / exit                  — exit REPL\n"
                 )
 
@@ -7658,6 +8788,112 @@ def run_repl() -> None:
                         print(f"  … ({len(result_map) - 20} more)")
                 else:
                     print("  (no results — try increasing max_ticks or reducing range)")
+
+            case "secd":
+                rule = RuleRegistry().get(state["rule"])
+                lo, hi = state["start"], min(state["stop"], state["start"] + 19)
+                results_secd = secd_fizzbuzz_range(rule, lo, hi)
+                print(f"  SECD machine output ({lo}..{hi}):")
+                for n_val, lbl in results_secd.items():
+                    print(f"    {n_val:>4}  {lbl!r}")
+                # Demonstrate the higher-order compose demo
+                n_demo = int(parts[1]) if len(parts) > 1 else 9
+                demo_result = secd_eval(secd_demo_program(n_demo), rule)
+                print(f"\n  compose/classify demo for n={n_demo}: {demo_result!r}")
+                # Bytecode disassembly
+                fb_code = secd_compile(EApp(EFizzBuzz(), EConst(15)))
+                print(f"\n  Bytecode for EApp(EFizzBuzz(), EConst(15)):")
+                for i, instr in enumerate(fb_code):
+                    print(f"    {i:>2}  {instr!r}")
+
+            case "unify":
+                rule_names = parts[1:] if len(parts) > 1 else list(RuleRegistry().names())[:3]
+                res = find_rule_mgu(rule_names)
+                if res.is_ok():
+                    _subst, lines = res.unwrap()
+                    for ln in lines:
+                        print(ln)
+                else:
+                    print(f"  Error: {res.error}")
+                # Also demonstrate raw term unification
+                t1 = TApp("div", (TVar("d"), TConst("Fizz")))
+                t2 = TApp("div", (TConst("3"), TVar("lbl")))
+                res2 = unify(t1, t2)
+                print(f"\n  Raw unify: {t1!r}  ↔  {t2!r}")
+                if res2.is_ok():
+                    mgu = res2.unwrap()
+                    print(f"  MGU: { {k: repr(v) for k, v in mgu.items()} }")
+                    print(f"  Unified: {_apply_subst(mgu, t1)!r}")
+                else:
+                    print(f"  No unifier: {res2.error}")
+
+            case "skiplist":
+                rule = RuleRegistry().get(state["rule"])
+                lo, hi = state["start"], state["stop"]
+                sl = build_label_skip_list(rule, lo, hi)
+                print(f"  {sl!r}")
+                # Range query
+                mid_lo, mid_hi = lo, (lo + hi) // 2
+                pairs = sl.range_query(mid_lo, mid_hi)
+                print(f"  Range [{mid_lo}, {mid_hi}]: {len(pairs)} items")
+                for n_val, lbl in pairs[:8]:
+                    print(f"    {n_val:>4}  {lbl}")
+                if len(pairs) > 8:
+                    print(f"    … ({len(pairs) - 8} more)")
+                # Inverted index
+                idx = skip_list_label_index(rule, lo, min(hi, lo + 29))
+                print(f"\n  Inverted index (first 30 n): {len(idx)} distinct labels")
+                for lbl_k in sorted(idx):
+                    ns = [v for _, v in idx[lbl_k].to_sorted_list()]
+                    print(f"    {lbl_k!r:<14}  n={ns[:10]}{'…' if len(ns) > 10 else ''}")
+
+            case "ftree":
+                rule = RuleRegistry().get(state["rule"])
+                lo, hi = state["start"], state["stop"]
+                tree = fizzbuzz_finger_tree(rule, lo, hi)
+                sz = _ftsz(tree)
+                print(f"  FingerTree size={sz}")
+                # Head / last
+                head_e, tail_t = ft_pop_l(tree)
+                last_t, last_e = ft_pop_r(tree)
+                print(f"  head={head_e!r}  last={last_e!r}")
+                # Random access
+                mid_i = sz // 2
+                elem_mid = ft_index(mid_i, tree)
+                print(f"  index[{mid_i}]={elem_mid!r}")
+                # Split and concat
+                left_t, right_t = ft_split_at(mid_i, tree)
+                rejoined = ft_concat(left_t, right_t)
+                print(f"  split at {mid_i}: left={_ftsz(left_t)}, right={_ftsz(right_t)}")
+                print(f"  concat round-trip ok: {_ftsz(rejoined) == sz}")
+                # First 5 of left half
+                left_list = ft_to_list(left_t)
+                print(f"  left half first 5: {left_list[:5]}")
+
+            case "xfx":
+                handler_name = parts[1] if len(parts) > 1 else "collect"
+                rule = RuleRegistry().get(state["rule"])
+                lo, hi = state["start"], state["stop"]
+                match handler_name:
+                    case "collect":
+                        pairs = xfb_run_collect(rule, lo, hi)
+                        print(f"  Collected {len(pairs)} pairs via algebraic effects:")
+                        for n_val, lbl in pairs[:20]:
+                            print(f"    {n_val:>4}  {lbl!r}")
+                        if len(pairs) > 20:
+                            print(f"    … ({len(pairs) - 20} more)")
+                    case "count":
+                        counts = xfb_run_count(rule, lo, hi)
+                        print(f"  Effect handler counts:")
+                        for lbl, cnt in counts.most_common():
+                            print(f"    {lbl!r:<16}  {cnt}")
+                    case "io":
+                        sink = BufferedSink()
+                        xfb_run_io(rule, lo, min(hi, lo + 9), sink)
+                        for ln in sink.lines:
+                            print(f"  {ln}")
+                    case _:
+                        print("Usage: xfx [collect|count|io]")
 
             case _:
                 print(f"Unknown command {cmd!r}. Type 'help'.")
@@ -7929,8 +9165,57 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
     gr_p.add_argument("--rule",    default="classic")
     gr_p.add_argument("--workers", type=int, default=4)
 
+    # ── secd ──────────────────────────────────────────────────────────────────
+    secd_p = sub.add_parser("secd", help="SECD abstract machine evaluation")
+    secd_p.add_argument("--start",  type=int, default=1)
+    secd_p.add_argument("--stop",   type=int, default=20)
+    secd_p.add_argument("--rule",   default="classic")
+    secd_p.add_argument("--demo",   type=int, default=0, metavar="N",
+                        help="Run higher-order SECD demo for n=N (0=off)")
+
+    # ── unify ─────────────────────────────────────────────────────────────────
+    unify_p = sub.add_parser("unify", help="First-order unification (Robinson MGU) of rule terms")
+    unify_p.add_argument("--rules", nargs="*", default=[],
+                         metavar="RULE", help="Rule names to unify (default: all registered)")
+    unify_p.add_argument("--t1",    default=None, metavar="TERM",
+                         help="Raw term expr e.g. \"TApp('div',(TVar('d'),TConst('Fizz')))\"")
+    unify_p.add_argument("--t2",    default=None, metavar="TERM")
+
+    # ── skiplist ──────────────────────────────────────────────────────────────
+    sl_p = sub.add_parser("skiplist", help="Skip list label index and range queries")
+    sl_p.add_argument("--start",   type=int, default=1)
+    sl_p.add_argument("--stop",    type=int, default=100)
+    sl_p.add_argument("--rule",    default="classic")
+    sl_p.add_argument("--levels",  type=int, default=16, metavar="L",
+                      help="Max skip list levels")
+    sl_p.add_argument("--query-lo", type=int, default=None, metavar="LO")
+    sl_p.add_argument("--query-hi", type=int, default=None, metavar="HI")
+
+    # ── ftree ─────────────────────────────────────────────────────────────────
+    ft_p = sub.add_parser("ftree", help="Finger tree sequence (split/concat/index)")
+    ft_p.add_argument("--start",  type=int, default=1)
+    ft_p.add_argument("--stop",   type=int, default=30)
+    ft_p.add_argument("--rule",   default="classic")
+    ft_p.add_argument("--index",  type=int, default=-1, metavar="I",
+                      help="Element to retrieve by index (-1 = mid)")
+    ft_p.add_argument("--split",  type=int, default=-1, metavar="I",
+                      help="Split position (-1 = mid)")
+
+    # ── xfx ───────────────────────────────────────────────────────────────────
+    xfx_p = sub.add_parser("xfx", help="Algebraic effect handlers (free-monad / open-union)")
+    xfx_p.add_argument("--start",   type=int, default=1)
+    xfx_p.add_argument("--stop",    type=int, default=20)
+    xfx_p.add_argument("--rule",    default="classic")
+    xfx_p.add_argument("--handler", choices=["collect", "count", "io"], default="collect")
+    xfx_p.add_argument("--deep",    action="store_true", default=True,
+                       help="Use deep handler (re-install after each effect)")
+    xfx_p.add_argument("--shallow", dest="deep", action="store_false",
+                       help="Use shallow handler (handle once only)")
+
     args = parser.parse_args(argv)
     cmd = args.cmd or "run"
+    if cmd == "run" and args.cmd is None:
+        args = parser.parse_args(["run"] + list(argv))
 
     match cmd:
         case "explain":
@@ -8474,6 +9759,126 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
             for n_val in sorted(result_map.keys()):
                 print(f"  {n_val:>4}  {result_map[n_val]}")
             print(f"\n  {len(result_map)} results collected", file=sys.stderr)
+
+        case "secd":
+            rule = RuleRegistry().get(args.rule)
+            results_secd = secd_fizzbuzz_range(rule, args.start, args.stop)
+            print(f"SECD machine FizzBuzz [{args.start}..{args.stop}] "
+                  f"rule={args.rule!r}:")
+            for n_val, lbl in results_secd.items():
+                print(f"  {n_val:>4}  {lbl!r}")
+            if args.demo > 0:
+                demo_result = secd_eval(secd_demo_program(args.demo), rule)
+                print(f"\n  Higher-order compose/classify demo for n={args.demo}: {demo_result!r}")
+            # Show bytecode for the simplest expression
+            code15 = secd_compile(EApp(EFizzBuzz(), EConst(15)))
+            print(f"\n  Bytecode for EApp(EFizzBuzz(), EConst(15)) [{len(code15)} instrs]:")
+            for i, instr in enumerate(code15):
+                print(f"    {i:>2}  {instr!r}")
+
+        case "unify":
+            _unify_ns = {
+                "TVar": TVar, "TConst": TConst, "TApp": TApp,
+            }
+            if args.t1 and args.t2:
+                try:
+                    t1_u = eval(args.t1, _unify_ns)  # noqa: S307
+                    t2_u = eval(args.t2, _unify_ns)  # noqa: S307
+                    res_u = unify(t1_u, t2_u)
+                    print(f"t1 = {t1_u!r}")
+                    print(f"t2 = {t2_u!r}")
+                    if res_u.is_ok():
+                        mgu = res_u.unwrap()
+                        print(f"MGU ({len(mgu)} binding(s)):")
+                        for var, val in mgu.items():
+                            print(f"  ?{var}  →  {val!r}")
+                        print(f"σ(t1) = {_apply_subst(mgu, t1_u)!r}")
+                    else:
+                        print(f"No unifier: {res_u.error}")
+                except Exception as exc:
+                    print(f"Error: {exc}")
+            else:
+                rule_names = args.rules or list(RuleRegistry().names())
+                res_mgu = find_rule_mgu(rule_names)
+                if res_mgu.is_ok():
+                    _, lines = res_mgu.unwrap()
+                    for ln in lines:
+                        print(ln)
+                else:
+                    print(f"Error: {res_mgu.error}")
+
+        case "skiplist":
+            rule = RuleRegistry().get(args.rule)
+            sl = build_label_skip_list(rule, args.start, args.stop)
+            print(f"SkipList over [{args.start}..{args.stop}] rule={args.rule!r}: {sl!r}")
+            q_lo = args.query_lo if args.query_lo is not None else args.start
+            q_hi = args.query_hi if args.query_hi is not None else (args.start + args.stop) // 2
+            pairs_sl = sl.range_query(q_lo, q_hi)
+            print(f"\nRange query [{q_lo}..{q_hi}]: {len(pairs_sl)} items")
+            for n_val, lbl in pairs_sl:
+                print(f"  {n_val:>4}  {lbl}")
+            # Inverted index
+            idx_sl = skip_list_label_index(rule, args.start, args.stop)
+            print(f"\nInverted label index: {len(idx_sl)} distinct labels")
+            for lbl_k in sorted(idx_sl):
+                ns_sl = [v for _, v in idx_sl[lbl_k].to_sorted_list()]
+                print(f"  {lbl_k!r:<14}  count={len(ns_sl)}  "
+                      f"n_first={ns_sl[:5]}{'…' if len(ns_sl) > 5 else ''}")
+
+        case "ftree":
+            rule = RuleRegistry().get(args.rule)
+            tree = fizzbuzz_finger_tree(rule, args.start, args.stop)
+            sz = _ftsz(tree)
+            print(f"FingerTree [{args.start}..{args.stop}] rule={args.rule!r}: size={sz}")
+            # Head and last
+            if sz > 0:
+                h_e, _ = ft_pop_l(tree)
+                _, l_e = ft_pop_r(tree)
+                print(f"  head={h_e!r}  last={l_e!r}")
+            # Random access
+            idx_ft = args.index if args.index >= 0 else sz // 2
+            if 0 <= idx_ft < sz:
+                print(f"  index[{idx_ft}] = {ft_index(idx_ft, tree)!r}")
+            # Split
+            split_i = args.split if args.split >= 0 else sz // 2
+            if 0 < split_i < sz:
+                left_ft, right_ft = ft_split_at(split_i, tree)
+                print(f"  split at {split_i}: left={_ftsz(left_ft)}, right={_ftsz(right_ft)}")
+                rejoined = ft_concat(left_ft, right_ft)
+                all_orig = ft_to_list(tree)
+                all_rejoin = ft_to_list(rejoined)
+                print(f"  concat round-trip ok: {all_orig == all_rejoin}")
+            # Print a sample
+            items_ft = ft_to_list(tree)
+            print(f"\nFirst 10 items: {items_ft[:10]}")
+            if len(items_ft) > 10:
+                print(f"  … ({len(items_ft) - 10} more)")
+
+        case "xfx":
+            rule = RuleRegistry().get(args.rule)
+            match args.handler:
+                case "collect":
+                    pairs_x = xfb_run_collect(rule, args.start, args.stop)
+                    labelled_x = [(n, l) for n, l in pairs_x if l]
+                    print(f"Algebraic effects (collect handler, deep={args.deep}):")
+                    print(f"  Total emitted: {len(pairs_x)}, labelled: {len(labelled_x)}")
+                    for n_val, lbl in pairs_x[:20]:
+                        print(f"  {n_val:>4}  {lbl!r}")
+                    if len(pairs_x) > 20:
+                        print(f"  … ({len(pairs_x) - 20} more)")
+                case "count":
+                    counts_x = xfb_run_count(rule, args.start, args.stop)
+                    print(f"Algebraic effects (count handler):")
+                    for lbl, cnt in counts_x.most_common():
+                        print(f"  {lbl!r:<16}  {cnt}")
+                case "io":
+                    sink_x = BufferedSink()
+                    xfb_run_io(rule, args.start, args.stop, sink_x)
+                    print(f"Algebraic effects (io handler) — {len(sink_x.lines)} lines:")
+                    for ln in sink_x.lines[:30]:
+                        print(f"  {ln}")
+                    if len(sink_x.lines) > 30:
+                        print(f"  … ({len(sink_x.lines) - 30} more)")
 
         case "run":
             _mw_map: dict[str, Middleware] = {
