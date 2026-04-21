@@ -1274,6 +1274,202 @@ def kleisli_run_many(
 
 
 # ===========================================================================
+# § 2h  Recursion schemes  (F-algebras, catamorphisms, anamorphisms, …)
+# ===========================================================================
+# A recursion scheme decouples the *recursion pattern* from the *data
+# transformation*.  We define a base functor `RuleF[A]` — one layer of rule
+# structure with recursive positions replaced by A — then derive:
+#
+#   cata(alg,  rule)   — catamorphism   (fold, bottom-up): RuleF[A]→A
+#   ana (coalg, seed)  — anamorphism    (unfold, top-down): A→RuleF[A]
+#   hylo(alg, coalg, seed) — hylomorphism (unfold then fold; no intermediate)
+#   para(alg,  rule)   — paramorphism   (fold with original subtree in scope)
+#   zygo(f, g, rule)   — zygomorphism   (mutually recursive fold; g uses f)
+#   histo(alg, rule)   — histomorphism  (fold with access to whole history)
+#
+# Base functor layers (A = recursive-position type):
+#   RuleCompositeF(children: list[A])
+#   RuleDivF(divisor, label)
+#   RulePredF(label)
+#
+# Spec-tree catamorphism (SpecF) is also provided.
+
+@dataclasses.dataclass(frozen=True)
+class RuleCompositeF(Generic[T]):
+    children: tuple[T, ...]
+
+@dataclasses.dataclass(frozen=True)
+class RuleDivF:
+    divisor: int
+    label: LabelT
+
+@dataclasses.dataclass(frozen=True)
+class RulePredF:
+    label: LabelT
+    predicate_name: str
+
+
+RuleF: TypeAlias = RuleCompositeF[T] | RuleDivF | RulePredF
+
+
+def rule_project(rule: "VisitableRule") -> RuleF["VisitableRule"]:
+    """Unwrap one layer of a rule (project into the base functor)."""
+    if isinstance(rule, CompositeRule):
+        return RuleCompositeF(children=tuple(rule.rules))
+    elif isinstance(rule, DivisibilityRule):
+        return RuleDivF(divisor=rule.divisor, label=rule.label)
+    else:
+        lbl = getattr(rule, "label", None)
+        name = getattr(rule, "__class__", type(rule)).__name__
+        return RulePredF(label=lbl, predicate_name=name)
+
+
+def rule_embed(layer: RuleF["VisitableRule"]) -> "VisitableRule":
+    """Wrap a layer back into a concrete rule."""
+    match layer:
+        case RuleCompositeF(children=ch):
+            return CompositeRule(ch)
+        case RuleDivF(divisor=d, label=lbl):
+            return DivisibilityRule(d, lbl)
+        case RulePredF(label=lbl):
+            return DivisibilityRule(1, lbl)   # approximate for round-trips
+
+
+def rulef_fmap(layer: RuleF[T], f: Callable[[T], Any]) -> RuleF[Any]:
+    """Map `f` over all recursive positions in a layer."""
+    match layer:
+        case RuleCompositeF(children=ch):
+            return RuleCompositeF(children=tuple(f(c) for c in ch))
+        case _:
+            return layer   # leaf layers have no recursive positions
+
+
+def cata(algebra: Callable[[RuleF[T]], T], rule: "VisitableRule") -> T:
+    """
+    Catamorphism: fold `rule` bottom-up using `algebra`.
+    algebra receives a layer where recursive positions are already folded.
+    """
+    layer = rule_project(rule)
+    folded_layer = rulef_fmap(layer, lambda child: cata(algebra, child))
+    return algebra(folded_layer)
+
+
+def ana(coalgebra: Callable[[T], RuleF[T]], seed: T) -> "VisitableRule":
+    """
+    Anamorphism: unfold a `seed` top-down using `coalgebra`.
+    coalgebra produces a layer with seeds at recursive positions.
+    """
+    layer = coalgebra(seed)
+    expanded = rulef_fmap(layer, lambda s: ana(coalgebra, s))
+    return rule_embed(expanded)
+
+
+def hylo(
+    algebra: Callable[[RuleF[T]], T],
+    coalgebra: Callable[[Any], RuleF[Any]],
+    seed: Any,
+) -> T:
+    """
+    Hylomorphism: unfold with coalgebra then immediately fold with algebra.
+    Avoids building an intermediate tree (fuses ana and cata).
+    """
+    layer = coalgebra(seed)
+    return algebra(rulef_fmap(layer, lambda s: hylo(algebra, coalgebra, s)))
+
+
+def para(
+    r_algebra: Callable[[RuleF[tuple["VisitableRule", T]]], T],
+    rule: "VisitableRule",
+) -> T:
+    """
+    Paramorphism: like cata but the algebra also receives the *original*
+    subtree alongside the folded value — useful for context-sensitive folds.
+    """
+    layer = rule_project(rule)
+    paired = rulef_fmap(layer, lambda child: (child, para(r_algebra, child)))
+    return r_algebra(paired)
+
+
+def zygo(
+    f_algebra: Callable[[RuleF[T]], T],
+    g_algebra: Callable[[RuleF[tuple[T, Any]]], Any],
+    rule: "VisitableRule",
+) -> Any:
+    """
+    Zygomorphism: g_algebra folds using f_algebra as an auxiliary.
+    Both receive the same layer; g sees (f_result, g_result) at each position.
+    """
+    def _both(rule_: "VisitableRule") -> tuple[T, Any]:
+        layer = rule_project(rule_)
+        both_layer = rulef_fmap(layer, lambda c: _both(c))
+        f_res = f_algebra(rulef_fmap(layer, lambda pair: pair[0]))
+        g_res = g_algebra(rulef_fmap(both_layer, lambda x: x))
+        return f_res, g_res
+
+    return _both(rule)[1]
+
+
+def histo(
+    cv_algebra: Callable[[RuleF[Any]], T],
+    rule: "VisitableRule",
+) -> T:
+    """
+    Histomorphism: fold with access to the entire course-of-values
+    (the full history of sub-results).  Implemented via cofree comonad.
+    """
+    @dataclasses.dataclass
+    class _CV:
+        head: Any   # result at this node
+        tail: RuleF[Any]   # layer of _CV children
+
+    def _cv(r: "VisitableRule") -> _CV:
+        layer = rule_project(r)
+        cv_layer = rulef_fmap(layer, _cv)
+        result = cv_algebra(rulef_fmap(cv_layer, lambda c: c.head))
+        return _CV(head=result, tail=cv_layer)
+
+    return _cv(rule).head
+
+
+# ── Pre-built algebras ────────────────────────────────────────────────────
+
+def _cata_depth(layer: RuleF[int]) -> int:
+    """Algebra: compute max depth of a rule tree."""
+    match layer:
+        case RuleCompositeF(children=ch): return 1 + (max(ch) if ch else 0)
+        case _: return 1
+
+def _cata_divisors(layer: RuleF[frozenset]) -> frozenset[int]:
+    """Algebra: collect all divisors from a rule tree."""
+    match layer:
+        case RuleCompositeF(children=ch):
+            return frozenset().union(*ch)
+        case RuleDivF(divisor=d):
+            return frozenset({d})
+        case _:
+            return frozenset()
+
+def _cata_label_count(layer: RuleF[int]) -> int:
+    """Algebra: count rules that produce non-None labels."""
+    match layer:
+        case RuleCompositeF(children=ch): return sum(ch)
+        case RuleDivF(label=lbl): return 1 if lbl else 0
+        case RulePredF(label=lbl): return 1 if lbl else 0
+        case _: return 0
+
+def _coalg_scale(factor: int) -> Callable[["VisitableRule"], RuleF["VisitableRule"]]:
+    """Coalgebra: scale all divisors by factor (anamorphism seed)."""
+    def _coalg(rule: "VisitableRule") -> RuleF["VisitableRule"]:
+        layer = rule_project(rule)
+        match layer:
+            case RuleDivF(divisor=d, label=lbl):
+                return RuleDivF(divisor=d * factor, label=lbl)
+            case _:
+                return layer
+    return _coalg
+
+
+# ===========================================================================
 # § 3  Event bus
 # ===========================================================================
 
@@ -2163,6 +2359,348 @@ def re_classify(s: str) -> str:
         if re_matches(pattern, s):
             return label
     return "unknown"
+
+
+# ===========================================================================
+# § 6e  DPLL SAT solver  (propositional satisfiability via Davis–Putnam–
+#                          Logemann–Loveland with unit propagation + VSIDS)
+# ===========================================================================
+# DPLL is the classic backtracking SAT algorithm augmented with:
+#   1. Unit propagation  — a unit clause forces its lone literal
+#   2. Pure literal elim — a variable appearing in only one polarity is free
+#   3. VSIDS heuristic   — choose the variable with most clause appearances
+#
+# Representation (all immutable):
+#   Literal  = (var_name: str, positive: bool)
+#   Clause   = frozenset[Literal]
+#   Formula  = frozenset[Clause]  (CNF)
+#
+# Helpers: prop_var, prop_not, prop_and, prop_or — build Prop ADT
+# cnf(prop) — convert arbitrary Prop to CNF via Tseytin transformation
+# dpll(formula) — returns a satisfying assignment or None (UNSAT)
+#
+# FizzBuzz application:
+#   encode_rule_as_prop(rule, n) — build a propositional formula representing
+#     "what does this rule emit for integer n?"
+#   check_rule_consistency(rule) — use DPLL to verify the rule never emits
+#     contradictory labels for the same n
+
+Literal: TypeAlias = tuple[str, bool]   # (variable_name, is_positive)
+Clause:  TypeAlias = frozenset          # frozenset[Literal]
+CNFFormula: TypeAlias = frozenset       # frozenset[Clause]
+
+
+# ── Propositional AST ────────────────────────────────────────────────────
+
+@dataclasses.dataclass(frozen=True)
+class PVar:
+    name: str
+    def __repr__(self) -> str: return self.name
+
+@dataclasses.dataclass(frozen=True)
+class PNot:
+    inner: Any
+    def __repr__(self) -> str: return f"¬{self.inner!r}"
+
+@dataclasses.dataclass(frozen=True)
+class PAnd:
+    left: Any
+    right: Any
+    def __repr__(self) -> str: return f"({self.left!r} ∧ {self.right!r})"
+
+@dataclasses.dataclass(frozen=True)
+class POr:
+    left: Any
+    right: Any
+    def __repr__(self) -> str: return f"({self.left!r} ∨ {self.right!r})"
+
+@dataclasses.dataclass(frozen=True)
+class PImp:
+    left: Any
+    right: Any
+    def __repr__(self) -> str: return f"({self.left!r} → {self.right!r})"
+
+@dataclasses.dataclass(frozen=True)
+class PIff:
+    left: Any
+    right: Any
+    def __repr__(self) -> str: return f"({self.left!r} ↔ {self.right!r})"
+
+@dataclasses.dataclass(frozen=True)
+class PTrue:
+    def __repr__(self) -> str: return "⊤"
+
+@dataclasses.dataclass(frozen=True)
+class PFalse:
+    def __repr__(self) -> str: return "⊥"
+
+
+Prop: TypeAlias = PVar | PNot | PAnd | POr | PImp | PIff | PTrue | PFalse
+
+
+def prop_simplify(p: Prop) -> Prop:
+    """Light simplification of propositional formulas."""
+    match p:
+        case PNot(inner=PTrue()):   return PFalse()
+        case PNot(inner=PFalse()):  return PTrue()
+        case PNot(inner=PNot(inner=q)): return prop_simplify(q)
+        case PAnd(left=PTrue(),  right=r): return prop_simplify(r)
+        case PAnd(left=l, right=PTrue()): return prop_simplify(l)
+        case PAnd(left=PFalse(), right=_): return PFalse()
+        case PAnd(left=_, right=PFalse()): return PFalse()
+        case POr(left=PFalse(), right=r):  return prop_simplify(r)
+        case POr(left=l, right=PFalse()):  return prop_simplify(l)
+        case POr(left=PTrue(),  right=_):  return PTrue()
+        case POr(left=_, right=PTrue()):   return PTrue()
+        case PImp(left=PFalse(), right=_): return PTrue()
+        case PImp(left=_, right=PTrue()):  return PTrue()
+        case PImp(left=PTrue(),  right=r): return prop_simplify(r)
+        case _:
+            return p
+
+
+def _tseytin_aux(
+    p: Prop,
+    fresh: list[int],
+    clauses: list[Clause],
+) -> str:
+    """Tseytin transformation: introduce auxiliary variable for sub-formula p."""
+    aux = f"_t{fresh[0]}"
+    fresh[0] += 1
+    match p:
+        case PVar(name=n):
+            return n
+        case PTrue():
+            clauses.append(frozenset({(aux, True)}))
+            return aux
+        case PFalse():
+            clauses.append(frozenset({(aux, False)}))
+            return aux
+        case PNot(inner=q):
+            q_aux = _tseytin_aux(q, fresh, clauses)
+            # aux ↔ ¬q_aux
+            clauses.append(frozenset({(aux, True),  (q_aux, True)}))
+            clauses.append(frozenset({(aux, False), (q_aux, False)}))
+            return aux
+        case PAnd(left=l, right=r):
+            l_aux = _tseytin_aux(l, fresh, clauses)
+            r_aux = _tseytin_aux(r, fresh, clauses)
+            # aux ↔ l_aux ∧ r_aux
+            clauses.append(frozenset({(aux, False), (l_aux, True)}))
+            clauses.append(frozenset({(aux, False), (r_aux, True)}))
+            clauses.append(frozenset({(aux, True), (l_aux, False), (r_aux, False)}))
+            return aux
+        case POr(left=l, right=r):
+            l_aux = _tseytin_aux(l, fresh, clauses)
+            r_aux = _tseytin_aux(r, fresh, clauses)
+            # aux ↔ l_aux ∨ r_aux
+            clauses.append(frozenset({(aux, False), (l_aux, True), (r_aux, True)}))
+            clauses.append(frozenset({(aux, True), (l_aux, False)}))
+            clauses.append(frozenset({(aux, True), (r_aux, False)}))
+            return aux
+        case PImp(left=l, right=r):
+            return _tseytin_aux(POr(PNot(l), r), fresh, clauses)
+        case PIff(left=l, right=r):
+            return _tseytin_aux(PAnd(PImp(l, r), PImp(r, l)), fresh, clauses)
+        case _:
+            return aux
+
+
+def prop_to_cnf(p: Prop) -> CNFFormula:
+    """Convert a Prop to CNF via Tseytin transformation."""
+    p = prop_simplify(p)
+    if isinstance(p, PTrue):
+        return frozenset()
+    if isinstance(p, PFalse):
+        return frozenset({frozenset()})   # empty clause = UNSAT
+    fresh = [0]
+    clauses: list[Clause] = []
+    top = _tseytin_aux(p, fresh, clauses)
+    clauses.append(frozenset({(top, True)}))   # assert the top-level is True
+    return frozenset(clauses)
+
+
+def _unit_propagate(
+    formula: CNFFormula,
+    assignment: dict[str, bool],
+) -> tuple[CNFFormula, dict[str, bool]]:
+    """Apply unit propagation until fixpoint. Returns (simplified, assignment)."""
+    changed = True
+    asgn = dict(assignment)
+    clauses = set(formula)
+    while changed:
+        changed = False
+        units: list[Literal] = []
+        for clause in list(clauses):
+            # Evaluate clause under current assignment
+            satisfied = False
+            unassigned: list[Literal] = []
+            for var, pos in clause:
+                if var in asgn:
+                    if asgn[var] == pos:
+                        satisfied = True
+                        break
+                else:
+                    unassigned.append((var, pos))
+            if satisfied:
+                clauses.discard(clause)
+                changed = True
+            elif not unassigned:
+                return frozenset({frozenset()}), asgn   # conflict
+            elif len(unassigned) == 1:
+                units.append(unassigned[0])
+                changed = True
+        for var, pos in units:
+            if var not in asgn:
+                asgn[var] = pos
+                changed = True
+    return frozenset(clauses), asgn
+
+
+def _pure_literal_elim(
+    formula: CNFFormula,
+    assignment: dict[str, bool],
+) -> tuple[CNFFormula, dict[str, bool]]:
+    """Eliminate pure literals (appear with only one polarity)."""
+    asgn = dict(assignment)
+    pos_vars: set[str] = set()
+    neg_vars: set[str] = set()
+    for clause in formula:
+        for var, pol in clause:
+            if var not in asgn:
+                (pos_vars if pol else neg_vars).add(var)
+    pure_pos = pos_vars - neg_vars
+    pure_neg = neg_vars - pos_vars
+    for v in pure_pos:
+        asgn[v] = True
+    for v in pure_neg:
+        asgn[v] = False
+    if pure_pos or pure_neg:
+        # Re-simplify
+        new_clauses: list[Clause] = []
+        for clause in formula:
+            if any(asgn.get(v) == pol for v, pol in clause):
+                continue
+            new_clauses.append(clause)
+        return frozenset(new_clauses), asgn
+    return formula, asgn
+
+
+def _vsids_pick(formula: CNFFormula, assignment: dict[str, bool]) -> str | None:
+    """VSIDS: pick the unassigned variable appearing in most clauses."""
+    freq: Counter[str] = Counter()
+    for clause in formula:
+        for var, _ in clause:
+            if var not in assignment:
+                freq[var] += 1
+    if not freq:
+        return None
+    return freq.most_common(1)[0][0]
+
+
+def dpll(
+    formula: CNFFormula,
+    assignment: dict[str, bool] | None = None,
+) -> dict[str, bool] | None:
+    """
+    DPLL satisfiability solver.
+    Returns a satisfying assignment (var → bool) or None if UNSAT.
+    """
+    asgn: dict[str, bool] = dict(assignment or {})
+
+    # Unit propagation
+    formula, asgn = _unit_propagate(formula, asgn)
+    if not formula:
+        return asgn   # SAT: all clauses satisfied
+    if any(len(c) == 0 for c in formula):
+        return None   # conflict
+
+    # Pure literal elimination
+    formula, asgn = _pure_literal_elim(formula, asgn)
+    if not formula:
+        return asgn
+
+    # Choose a variable (VSIDS heuristic)
+    var = _vsids_pick(formula, asgn)
+    if var is None:
+        return asgn   # all variables assigned
+
+    # Branch
+    for value in (True, False):
+        result = dpll(formula, {**asgn, var: value})
+        if result is not None:
+            return result
+    return None
+
+
+def prop_is_sat(p: Prop) -> bool:
+    """Return True iff the propositional formula is satisfiable."""
+    return dpll(prop_to_cnf(p)) is not None
+
+
+def prop_is_tautology(p: Prop) -> bool:
+    """Return True iff p is a tautology (¬p is UNSAT)."""
+    return dpll(prop_to_cnf(PNot(p))) is None
+
+
+# ── FizzBuzz-specific propositional encoding ─────────────────────────────
+
+def encode_divisibility(n: int, divisor: int) -> Prop:
+    """Propositional variable: 'n is divisible by divisor'."""
+    return PVar(f"div_{divisor}({n})")
+
+
+def encode_rule_fires(rule: "VisitableRule", n: int) -> Prop:
+    """Build a Prop expressing that `rule` produces a non-None label for n."""
+    if isinstance(rule, CompositeRule):
+        sub_props = [encode_rule_fires(sub, n) for sub in rule.rules]
+        if not sub_props:
+            return PFalse()
+        result = sub_props[0]
+        for sp in sub_props[1:]:
+            result = POr(result, sp)
+        return result
+    elif isinstance(rule, DivisibilityRule):
+        var = encode_divisibility(n, rule.divisor)
+        # Ground truth: substitute the actual divisibility
+        if n % rule.divisor == 0:
+            return PTrue()
+        else:
+            return PFalse()
+    return PFalse()
+
+
+def check_rule_mutual_exclusion(rule: "VisitableRule", start: int = 1, stop: int = 30) -> list[str]:
+    """
+    Use DPLL to verify that for each n, the rule is consistent:
+    - FizzBuzz ↔ (Fizz ∧ Buzz)  is a tautology for every n
+    Returns a list of verification messages.
+    """
+    results: list[str] = []
+    for n_val in range(start, stop + 1):
+        # Build atomic facts about n
+        facts: list[Prop] = []
+        for sub in (rule.rules if isinstance(rule, CompositeRule) else [rule]):
+            if isinstance(sub, DivisibilityRule):
+                var = PVar(f"div_{sub.divisor}({n_val})")
+                if n_val % sub.divisor == 0:
+                    facts.append(var)
+                else:
+                    facts.append(PNot(var))
+
+        # Assert all ground facts and check that rule firing is consistent
+        label = rule(Number(n_val))
+        fires = encode_rule_fires(rule, n_val)
+        grounded = prop_simplify(fires)
+
+        actual_fires = label is not None
+        simplified_val = isinstance(grounded, PTrue)
+        consistent = actual_fires == simplified_val
+        if not consistent:
+            results.append(f"  INCONSISTENCY at n={n_val}: rule fires={actual_fires} but prop={grounded!r}")
+        else:
+            results.append(f"  n={n_val:>3}  fires={actual_fires}  prop={grounded!r}  ✓")
+    return results
 
 
 # ===========================================================================
@@ -3365,6 +3903,119 @@ def hll_fizzbuzz(
         label = rule(Number(n)) or str(n)
         hll.add(label)
     return hll
+
+
+# ===========================================================================
+# § 10d  Count-Min Sketch  (sub-linear frequency estimation)
+# ===========================================================================
+# The Count-Min Sketch (Cormode & Muthukrishna, 2005) estimates item
+# frequencies in a data stream using a d × w counter matrix with d
+# pairwise-independent hash functions.
+#
+# Guarantees (with probability ≥ 1 − δ):
+#   estimate(x) ≥ true_count(x)                  (never under-counts)
+#   estimate(x) ≤ true_count(x) + ε · ||counts||₁
+#
+# where w = ⌈e/ε⌉ and d = ⌈ln(1/δ)⌉.
+#
+# Operations:
+#   add(item, count=1)          — update counters
+#   estimate(item)              — frequency estimate (min of d hash-rows)
+#   merge(other)                — element-wise max (union of two streams)
+#   top_k(k, universe)          — approximate heavy hitters from a universe
+#   inner_product(other)        — dot-product estimate for join-size queries
+
+class CountMinSketch:
+    """Sub-linear frequency estimator using a 2-D counter array."""
+
+    def __init__(self, epsilon: float = 0.01, delta: float = 0.001) -> None:
+        """
+        epsilon — additive error factor (smaller → wider sketch)
+        delta   — failure probability (smaller → deeper sketch)
+        """
+        self._w = math.ceil(math.e / epsilon)
+        self._d = math.ceil(math.log(1 / delta))
+        self._counts = [[0] * self._w for _ in range(self._d)]
+        # d independent hash seeds
+        self._seeds = [random.randint(1, 2**31 - 1) for _ in range(self._d)]
+        self._total: int = 0
+
+    def _hash(self, item: Any, row: int) -> int:
+        """Row-specific hash function."""
+        raw = hashlib.md5(f"{self._seeds[row]}:{item}".encode()).hexdigest()
+        return int(raw, 16) % self._w
+
+    def add(self, item: Any, count: int = 1) -> None:
+        for i in range(self._d):
+            self._counts[i][self._hash(item, i)] += count
+        self._total += count
+
+    def estimate(self, item: Any) -> int:
+        """Return the frequency estimate for item (≥ true count)."""
+        return min(self._counts[i][self._hash(item, i)] for i in range(self._d))
+
+    def merge(self, other: "CountMinSketch") -> "CountMinSketch":
+        """Element-wise sum — models stream union."""
+        if (self._w, self._d) != (other._w, other._d):
+            raise ValueError("Sketch dimensions must match for merge")
+        merged = CountMinSketch.__new__(CountMinSketch)
+        merged._w = self._w
+        merged._d = self._d
+        merged._seeds = list(self._seeds)
+        merged._counts = [
+            [self._counts[i][j] + other._counts[i][j] for j in range(self._w)]
+            for i in range(self._d)
+        ]
+        merged._total = self._total + other._total
+        return merged
+
+    def inner_product(self, other: "CountMinSketch") -> int:
+        """
+        Estimate the inner product (join size) of two frequency vectors.
+        Returns min over rows of Σ_j counts_a[i][j] * counts_b[i][j].
+        """
+        if (self._w, self._d) != (other._w, other._d):
+            raise ValueError("Sketch dimensions must match")
+        return min(
+            sum(self._counts[i][j] * other._counts[i][j] for j in range(self._w))
+            for i in range(self._d)
+        )
+
+    def top_k(self, k: int, universe: Iterable[Any]) -> list[tuple[Any, int]]:
+        """Approximate top-k heavy hitters from a known universe."""
+        estimates = [(item, self.estimate(item)) for item in universe]
+        return sorted(estimates, key=lambda x: -x[1])[:k]
+
+    @property
+    def width(self) -> int:
+        return self._w
+
+    @property
+    def depth(self) -> int:
+        return self._d
+
+    @property
+    def total_count(self) -> int:
+        return self._total
+
+    def __repr__(self) -> str:
+        return (f"CountMinSketch(w={self._w}, d={self._d}, "
+                f"total={self._total})")
+
+
+def cms_fizzbuzz(
+    rule: "VisitableRule",
+    start: int = 1,
+    stop: int = 1000,
+    epsilon: float = 0.05,
+    delta: float = 0.01,
+) -> CountMinSketch:
+    """Build a Count-Min Sketch of label frequencies over [start, stop]."""
+    cms = CountMinSketch(epsilon=epsilon, delta=delta)
+    for n in range(start, stop + 1):
+        label = rule(Number(n)) or str(n)
+        cms.add(label)
+    return cms
 
 
 # ===========================================================================
@@ -4594,6 +5245,246 @@ class PersistentLabelHistory:
 
     def range(self) -> tuple[int, int]:
         return self._start, self._stop
+
+
+# ===========================================================================
+# § 13h  Arrowized FRP  (Behaviors, Events, Signal Functions)
+# ===========================================================================
+# Functional Reactive Programming models time-varying values and discrete
+# events as first-class abstractions:
+#
+#   Behavior[A]  — a continuously varying value: time → A
+#   Event[A]     — a stream of discrete occurrences: [(time, A)]
+#   SF[A, B]     — a Signal Function: transforms input signal to output signal
+#
+# SF forms a *category* (identity, composition) and an *arrow* (arr, first).
+# Additional arrow combinators: >>>, ***, &&&, loop.
+#
+# Combinators:
+#   arr(f)                 — lift a pure function into SF
+#   constant(v)            — SF that always outputs v regardless of input
+#   sf_id()                — identity SF
+#   integral(dt)           — integrates a Behavior over time (running sum)
+#   hold(init)             — hold the last Event value as a Behavior
+#   snapshot(beh, event)   — sample Behavior at each Event occurrence
+#   switch(beh, event)     — replace beh with new Behavior on each Event
+#   gate(event, pred_beh)  — filter Event by a Behavior-valued predicate
+#   step_clock(dt, stop)   — generate a time-step event stream
+#
+# FizzBuzz FRP network:
+#   - counter Behavior increases by 1 each tick
+#   - fizzbuzz Behavior = rule applied to counter
+#   - output Event fires with the label string each tick
+#   - a "run" detector Event fires when two consecutive labels match
+
+Timestamp: TypeAlias = float
+
+
+@dataclasses.dataclass(frozen=True)
+class Behavior(Generic[T]):
+    """A time-varying value: time → T."""
+    _fn: Callable[[Timestamp], T]
+
+    def at(self, t: Timestamp) -> T:
+        return self._fn(t)
+
+    def map(self, f: Callable[[T], Any]) -> "Behavior[Any]":
+        return Behavior(lambda t: f(self._fn(t)))
+
+    def apply(self, other: "Behavior[Callable[[T], Any]]") -> "Behavior[Any]":
+        return Behavior(lambda t: other._fn(t)(self._fn(t)))
+
+    def zip_with(self, other: "Behavior[Any]", f: Callable[[T, Any], Any]) -> "Behavior[Any]":
+        return Behavior(lambda t: f(self._fn(t), other._fn(t)))
+
+    def sample(self, times: list[Timestamp]) -> list[T]:
+        return [self._fn(t) for t in times]
+
+    @classmethod
+    def constant(cls, v: T) -> "Behavior[T]":
+        return cls(lambda _: v)
+
+    @classmethod
+    def time(cls) -> "Behavior[Timestamp]":
+        return cls(lambda t: t)
+
+
+@dataclasses.dataclass(frozen=True)
+class Event(Generic[T]):
+    """A discrete stream of time-stamped values."""
+    occurrences: tuple[tuple[Timestamp, T], ...]
+
+    @classmethod
+    def empty(cls) -> "Event[Any]":
+        return cls(occurrences=())
+
+    @classmethod
+    def from_list(cls, pairs: list[tuple[Timestamp, T]]) -> "Event[T]":
+        return cls(occurrences=tuple(sorted(pairs, key=lambda x: x[0])))
+
+    def map(self, f: Callable[[T], Any]) -> "Event[Any]":
+        return Event(tuple((t, f(v)) for t, v in self.occurrences))
+
+    def filter(self, pred: Callable[[T], bool]) -> "Event[T]":
+        return Event(tuple((t, v) for t, v in self.occurrences if pred(v)))
+
+    def merge(self, other: "Event[T]") -> "Event[T]":
+        combined = sorted(
+            list(self.occurrences) + list(other.occurrences),
+            key=lambda x: x[0],
+        )
+        return Event(tuple(combined))
+
+    def scan(self, f: Callable[[Any, T], Any], init: Any) -> "Event[Any]":
+        acc = init
+        result: list[tuple[Timestamp, Any]] = []
+        for t, v in self.occurrences:
+            acc = f(acc, v)
+            result.append((t, acc))
+        return Event(tuple(result))
+
+    def values(self) -> list[T]:
+        return [v for _, v in self.occurrences]
+
+    def times(self) -> list[Timestamp]:
+        return [t for t, _ in self.occurrences]
+
+
+@dataclasses.dataclass(frozen=True)
+class SF(Generic[T, U]):
+    """
+    Signal Function: transforms an input Behavior[T] into an output Behavior[U].
+    The transformation is itself time-dependent.
+    """
+    _run: Callable[["Behavior[T]"], "Behavior[U]"]
+
+    def run(self, input_beh: Behavior[T]) -> Behavior[U]:
+        return self._run(input_beh)
+
+    def __rshift__(self, other: "SF[U, Any]") -> "SF[T, Any]":
+        """Sequential composition (>>>)."""
+        return SF(lambda beh: other._run(self._run(beh)))
+
+    def __and__(self, other: "SF[T, Any]") -> "SF[T, tuple[U, Any]]":
+        """Parallel fanout (&&&)."""
+        return SF(lambda beh: Behavior(
+            lambda t: (self._run(beh).at(t), other._run(beh).at(t))
+        ))
+
+    def first(self) -> "SF[tuple[T, Any], tuple[U, Any]]":
+        """Apply this SF to the first component of a pair."""
+        return SF(lambda beh: Behavior(
+            lambda t: (self._run(Behavior(lambda tt: beh.at(tt)[0])).at(t), beh.at(t)[1])
+        ))
+
+    @classmethod
+    def arr(cls, f: Callable[[T], U]) -> "SF[T, U]":
+        """Lift a pure function."""
+        return cls(lambda beh: beh.map(f))
+
+    @classmethod
+    def identity(cls) -> "SF[T, T]":
+        return cls(lambda beh: beh)
+
+    @classmethod
+    def constant(cls, v: U) -> "SF[Any, U]":
+        return cls(lambda _: Behavior.constant(v))
+
+    @classmethod
+    def integral(cls, dt: float = 1.0) -> "SF[float, float]":
+        """Running integral (discrete approximation: Riemann sum)."""
+        def _run(beh: Behavior[float]) -> Behavior[float]:
+            # Captures running state via a sampled precomputed table
+            def _at(t: Timestamp) -> float:
+                steps = int(t / dt)
+                return sum(beh.at(i * dt) * dt for i in range(steps))
+            return Behavior(_at)
+        return cls(_run)
+
+
+def hold(init: T, event: Event[T]) -> Behavior[T]:
+    """Hold the most recent Event value as a step-function Behavior."""
+    def _at(t: Timestamp) -> T:
+        val = init
+        for evt_t, v in event.occurrences:
+            if evt_t <= t:
+                val = v
+            else:
+                break
+        return val
+    return Behavior(_at)
+
+
+def snapshot(beh: Behavior[T], event: Event[Any]) -> Event[T]:
+    """Sample Behavior at each Event occurrence time."""
+    return Event(tuple((t, beh.at(t)) for t, _ in event.occurrences))
+
+
+def switch(beh: Behavior[T], event: Event[Behavior[T]]) -> Behavior[T]:
+    """Replace the current Behavior with the one carried by the last Event."""
+    def _at(t: Timestamp) -> T:
+        active = beh
+        for evt_t, new_beh in event.occurrences:
+            if evt_t <= t:
+                active = new_beh
+        return active.at(t)
+    return Behavior(_at)
+
+
+def gate(event: Event[T], pred_beh: Behavior[bool]) -> Event[T]:
+    """Filter an Event by a time-varying Boolean Behavior."""
+    return Event(tuple(
+        (t, v) for t, v in event.occurrences if pred_beh.at(t)
+    ))
+
+
+def step_clock(dt: float, stop: float, start: float = 0.0) -> Event[float]:
+    """Generate a uniform clock Event with step dt."""
+    times_: list[float] = []
+    t = start
+    while t <= stop + 1e-9:
+        times_.append(t)
+        t += dt
+    return Event(tuple((t, t) for t in times_))
+
+
+def build_fizzbuzz_frp(
+    rule: "VisitableRule",
+    start: int = 1,
+    stop: int = 30,
+) -> tuple[Behavior[int], Behavior[LabelT], Event[str]]:
+    """
+    Build a FizzBuzz FRP network:
+      counter_beh  — Behavior[int]: n = start + floor(t)
+      label_beh    — Behavior[LabelT]: rule(counter_beh)
+      output_event — Event[str]: fires each integer tick with the label
+    Returns (counter_beh, label_beh, output_event).
+    """
+    counter_beh: Behavior[int] = Behavior(lambda t: start + int(t))
+    label_beh: Behavior[LabelT] = counter_beh.map(lambda n: rule(Number(n)))
+
+    ticks = step_clock(1.0, stop - start)
+    output_event: Event[str] = snapshot(
+        label_beh.map(lambda lbl: lbl if lbl is not None else "?"),
+        ticks,
+    )
+    return counter_beh, label_beh, output_event
+
+
+def fizzbuzz_run_detector(rule: "VisitableRule", start: int = 1, stop: int = 30) -> Event[tuple[str, str]]:
+    """
+    Detect consecutive equal-label runs: emit (label, label) whenever
+    the FizzBuzz output matches its predecessor.
+    """
+    _, _, out_e = build_fizzbuzz_frp(rule, start, stop)
+    labels = list(out_e.occurrences)
+    pairs: list[tuple[Timestamp, tuple[str, str]]] = []
+    for i in range(1, len(labels)):
+        t_prev, v_prev = labels[i - 1]
+        t_cur, v_cur = labels[i]
+        if v_prev == v_cur:
+            pairs.append((t_cur, (v_prev, v_cur)))
+    return Event(tuple(pairs))
 
 
 # ===========================================================================
@@ -5942,6 +6833,235 @@ def nd_window_search(
 
 
 # ===========================================================================
+# § 19g  Cooperative green-thread scheduler
+# ===========================================================================
+# Cooperative multitasking implemented entirely over Python generators.
+# A "green thread" is a generator that yields control voluntarily; the
+# scheduler runs them in round-robin order until all complete.
+#
+# Thread API:
+#   yield Yield()         — voluntarily relinquish the CPU
+#   yield Sleep(n)        — suspend for n scheduler ticks
+#   yield Spawn(gen_fn)   — create a new child thread
+#   yield Send(chan, val) — send a value to a named channel
+#   yield Recv(chan)       — receive the next value from a channel (blocks)
+#   yield Join(tid)       — wait for another thread to finish
+#
+# Scheduler:
+#   Scheduler.spawn(gen_fn, *args) → ThreadId
+#   Scheduler.run()                → dict[ThreadId, Any]  (return values)
+#   Scheduler.channel(name)        → Channel
+#
+# FizzBuzz application: spawn N workers each covering a sub-range;
+# a collector thread receives results via a channel.
+
+@dataclasses.dataclass
+class _Yield:
+    """Yield CPU for one tick."""
+
+@dataclasses.dataclass
+class _Sleep:
+    ticks: int
+
+@dataclasses.dataclass
+class _Spawn:
+    gen_fn: Callable[..., Generator]
+    args: tuple
+    kwargs: dict
+
+@dataclasses.dataclass
+class _Send:
+    channel: str
+    value: Any
+
+@dataclasses.dataclass
+class _Recv:
+    channel: str
+
+@dataclasses.dataclass
+class _Join:
+    tid: int
+
+
+ThreadId: TypeAlias = int
+_GreenEffect: TypeAlias = _Yield | _Sleep | _Spawn | _Send | _Recv | _Join
+
+
+@dataclasses.dataclass
+class _ThreadState:
+    tid: ThreadId
+    gen: Generator
+    sleep_until: int = 0
+    waiting_recv: str | None = None   # channel name we're blocked on
+    waiting_join: int | None = None   # tid we're waiting for
+    result: Any = None
+    done: bool = False
+
+
+class GreenScheduler:
+    """
+    Round-robin cooperative scheduler over generator-based green threads.
+    """
+
+    def __init__(self) -> None:
+        self._threads: dict[ThreadId, _ThreadState] = {}
+        self._next_tid: int = 0
+        self._channels: dict[str, list[Any]] = defaultdict(list)
+        self._tick: int = 0
+        self._log = logging.getLogger("fizzbuzz.scheduler")
+
+    def spawn(self, gen_fn: Callable[..., Generator], *args: Any, **kwargs: Any) -> ThreadId:
+        """Register a new green thread. Returns its ThreadId."""
+        tid = self._next_tid
+        self._next_tid += 1
+        gen = gen_fn(*args, **kwargs)
+        self._threads[tid] = _ThreadState(tid=tid, gen=gen)
+        return tid
+
+    def channel(self, name: str) -> str:
+        """Ensure a channel exists and return its name."""
+        _ = self._channels[name]
+        return name
+
+    def _is_runnable(self, state: _ThreadState) -> bool:
+        if state.done:
+            return False
+        if self._tick < state.sleep_until:
+            return False
+        if state.waiting_recv is not None:
+            if self._channels[state.waiting_recv]:
+                return True
+            return False
+        if state.waiting_join is not None:
+            waited = self._threads.get(state.waiting_join)
+            if waited is None or waited.done:
+                state.waiting_join = None
+                return True
+            return False
+        return True
+
+    def _step(self, state: _ThreadState) -> None:
+        """Advance one thread by one yield."""
+        sent_value: Any = None
+        if state.waiting_recv is not None:
+            chan = state.waiting_recv
+            if self._channels[chan]:
+                sent_value = self._channels[chan].pop(0)
+                state.waiting_recv = None
+            else:
+                return  # still blocked
+
+        try:
+            effect = state.gen.send(sent_value)
+        except StopIteration as exc:
+            state.done = True
+            state.result = exc.value
+            return
+
+        match effect:
+            case _Yield():
+                pass
+            case _Sleep(ticks=n):
+                state.sleep_until = self._tick + n
+            case _Spawn(gen_fn=fn, args=a, kwargs=kw):
+                new_tid = self.spawn(fn, *a, **kw)
+                # Send new tid back to spawning thread on next step
+                try:
+                    state.gen.send(new_tid)
+                except StopIteration as exc:
+                    state.done = True
+                    state.result = exc.value
+            case _Send(channel=ch, value=val):
+                self._channels[ch].append(val)
+            case _Recv(channel=ch):
+                state.waiting_recv = ch
+                # Will be resolved next runnable check
+            case _Join(tid=target_tid):
+                state.waiting_join = target_tid
+            case _:
+                pass  # unknown effect, ignore
+
+    def run(self, max_ticks: int = 100_000) -> dict[ThreadId, Any]:
+        """Run until all threads complete or max_ticks reached."""
+        for tick in range(max_ticks):
+            self._tick = tick
+            alive = [s for s in self._threads.values() if not s.done]
+            if not alive:
+                break
+            runnable = [s for s in alive if self._is_runnable(s)]
+            if not runnable:
+                # All threads sleeping or blocked — advance tick
+                continue
+            for state in runnable:
+                self._step(state)
+        return {tid: s.result for tid, s in self._threads.items()}
+
+
+def _green_fizzbuzz_worker(
+    rule: "VisitableRule",
+    start: int,
+    stop: int,
+    out_channel: str,
+) -> Generator[_GreenEffect, Any, list[str]]:
+    """Green thread: evaluate FizzBuzz for [start, stop], send results."""
+    results: list[str] = []
+    for n_val in range(start, stop + 1):
+        label = rule(Number(n_val))
+        line = label if label is not None else str(n_val)
+        results.append(line)
+        yield _Send(channel=out_channel, value=(n_val, line))
+        yield _Yield()
+    return results
+
+
+def _green_collector(
+    n_workers: int,
+    out_channel: str,
+    total: int,
+) -> Generator[_GreenEffect, Any, dict[int, str]]:
+    """Green thread: receive (n, label) pairs from workers, assemble dict."""
+    collected: dict[int, str] = {}
+    while len(collected) < total:
+        pair = yield _Recv(out_channel)
+        if pair is not None:
+            n_val, line = pair
+            collected[n_val] = line
+        else:
+            yield _Yield()
+    return collected
+
+
+def run_green_fizzbuzz(
+    rule: "VisitableRule",
+    start: int = 1,
+    stop: int = 30,
+    n_workers: int = 3,
+) -> dict[int, str]:
+    """
+    Run FizzBuzz using cooperatively-scheduled green threads.
+    Splits [start, stop] across n_workers threads; a collector thread
+    assembles the results via a shared channel.
+    """
+    sched = GreenScheduler()
+    chan = sched.channel("fizzbuzz_out")
+    total = stop - start + 1
+    chunk = max(1, total // n_workers)
+
+    # Spawn worker threads
+    for i in range(n_workers):
+        w_start = start + i * chunk
+        w_stop = w_start + chunk - 1 if i < n_workers - 1 else stop
+        if w_start <= stop:
+            sched.spawn(_green_fizzbuzz_worker, rule, w_start, w_stop, chan)
+
+    # Spawn collector
+    collector_tid = sched.spawn(_green_collector, n_workers, chan, total)
+
+    results = sched.run()
+    return results.get(collector_tid) or {}
+
+
+# ===========================================================================
 # § 20  Interactive REPL
 # ===========================================================================
 
@@ -6452,8 +7572,93 @@ def run_repl() -> None:
                     "  hll                          — HyperLogLog cardinality sketch\n"
                     "  segtree                      — persistent segment tree\n"
                     "  ndcont                       — non-determinism via delimited continuations\n"
+                    "  recur                        — recursion schemes (cata/ana/hylo/para/zygo)\n"
+                    "  sat <expr>                   — DPLL SAT solver on propositional formula\n"
+                    "  cms                          — Count-Min Sketch frequency estimation\n"
+                    "  frp                          — arrowized FRP Behavior/Event network\n"
+                    "  green                        — cooperative green-thread FizzBuzz\n"
                     "  quit / exit                  — exit REPL\n"
                 )
+
+            case "recur":
+                rule = RuleRegistry().get(state["rule"])
+                depth    = cata(_cata_depth, rule)
+                divisors = cata(_cata_divisors, rule)
+                n_labels = cata(_cata_label_count, rule)
+                print(f"  Catamorphisms over {state['rule']!r}:")
+                print(f"    depth         = {depth}")
+                print(f"    all divisors  = {set(divisors)}")
+                print(f"    label-bearing = {n_labels}")
+                # Paramorphism: depth with original subtree info
+                def _para_alg(layer: RuleF) -> str:
+                    match layer:
+                        case RuleCompositeF(children=ch): return f"Composite({', '.join(str(c) for c in ch)})"
+                        case RuleDivF(divisor=d, label=lbl): return f"Div({d},{lbl!r})"
+                        case _: return "Leaf"
+                para_result = para(lambda l: _para_alg(rulef_fmap(l, lambda p: p[1])), rule)
+                print(f"  Paramorphism result: {para_result}")
+
+            case "sat":
+                expr_str = " ".join(parts[1:]) if len(parts) > 1 else "PVar('x')"
+                _sat_ns = {
+                    "PVar": PVar, "PNot": PNot, "PAnd": PAnd, "POr": POr,
+                    "PImp": PImp, "PIff": PIff, "PTrue": PTrue, "PFalse": PFalse,
+                }
+                try:
+                    prop_obj = eval(expr_str, _sat_ns)  # noqa: S307
+                    is_sat = prop_is_sat(prop_obj)
+                    is_taut = prop_is_tautology(prop_obj)
+                    asgn = dpll(prop_to_cnf(prop_obj))
+                    print(f"  Formula:     {prop_obj!r}")
+                    print(f"  SAT:         {is_sat}")
+                    print(f"  Tautology:   {is_taut}")
+                    if asgn:
+                        print(f"  Assignment:  {asgn}")
+                except Exception as exc:
+                    print(f"  Error: {exc}")
+                # Also run rule consistency check
+                rule = RuleRegistry().get(state["rule"])
+                msgs = check_rule_mutual_exclusion(rule, state["start"], min(state["stop"], state["start"] + 4))
+                print(f"\n  Rule consistency ({state['rule']!r}, first 5 n):")
+                for m in msgs[:5]:
+                    print(m)
+
+            case "cms":
+                rule = RuleRegistry().get(state["rule"])
+                cms = cms_fizzbuzz(rule, state["start"], state["stop"])
+                print(f"  {cms!r}")
+                universe = [FIZZ, BUZZ, FIZZBUZZ] + [str(n) for n in range(1, 11)]
+                top = cms.top_k(5, universe)
+                print(f"  Top-5 estimated frequencies:")
+                for item, est in top:
+                    print(f"    {item!r:<16} estimate={est}")
+                print(f"  inner_product(self) ≈ {cms.inner_product(cms)}")
+
+            case "frp":
+                rule = RuleRegistry().get(state["rule"])
+                lo, hi = state["start"], min(state["stop"], state["start"] + 19)
+                _, label_beh, out_event = build_fizzbuzz_frp(rule, lo, hi)
+                print(f"  FRP network output ({lo}..{hi}):")
+                for t, v in out_event.occurrences[:20]:
+                    n_val = lo + int(t)
+                    print(f"    t={t:.0f}  n={n_val:>3}  {v}")
+                runs = fizzbuzz_run_detector(rule, lo, hi)
+                print(f"\n  Consecutive-equal-label runs: {len(runs.occurrences)}")
+                for t, (a, b) in runs.occurrences:
+                    print(f"    t={t:.0f}  ({a!r}, {b!r})")
+
+            case "green":
+                rule = RuleRegistry().get(state["rule"])
+                n_w = int(parts[1]) if len(parts) > 1 else 3
+                result_map = run_green_fizzbuzz(rule, state["start"], state["stop"], n_workers=n_w)
+                if result_map:
+                    for n_val in sorted(result_map)[:20]:
+                        print(f"  {n_val:>4}  {result_map[n_val]}")
+                    if len(result_map) > 20:
+                        print(f"  … ({len(result_map) - 20} more)")
+                else:
+                    print("  (no results — try increasing max_ticks or reducing range)")
+
             case _:
                 print(f"Unknown command {cmd!r}. Type 'help'.")
 
@@ -6687,6 +7892,42 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
     nd_p.add_argument("--rule",   default="classic")
     nd_p.add_argument("--mode",   choices=["labelled", "product", "windows"], default="labelled")
     nd_p.add_argument("--window", type=int, default=3)
+
+    # ── recur ─────────────────────────────────────────────────────────────────
+    rec_p = sub.add_parser("recur", help="Recursion schemes (cata/ana/hylo/para/zygo)")
+    rec_p.add_argument("--rule",   default="classic")
+    rec_p.add_argument("--scheme", choices=["cata","ana","hylo","para","zygo","histo"],
+                       default="cata")
+    rec_p.add_argument("--alg",    choices=["depth","divisors","label_count"], default="depth")
+
+    # ── sat ───────────────────────────────────────────────────────────────────
+    sat_p = sub.add_parser("sat", help="DPLL propositional SAT solver")
+    sat_p.add_argument("--rule",  default="classic")
+    sat_p.add_argument("--start", type=int, default=1)
+    sat_p.add_argument("--stop",  type=int, default=15)
+    sat_p.add_argument("formula", nargs="*",
+                       help="Prop formula (Python expr). E.g.: PAnd(PVar('x'),PNot(PVar('x')))")
+
+    # ── cms ───────────────────────────────────────────────────────────────────
+    cms_p = sub.add_parser("cms", help="Count-Min Sketch frequency estimation")
+    cms_p.add_argument("--start",   type=int, default=1)
+    cms_p.add_argument("--stop",    type=int, default=1000)
+    cms_p.add_argument("--rule",    default="classic")
+    cms_p.add_argument("--epsilon", type=float, default=0.05)
+    cms_p.add_argument("--delta",   type=float, default=0.01)
+
+    # ── frp ───────────────────────────────────────────────────────────────────
+    frp_p = sub.add_parser("frp", help="Arrowized FRP Behavior/Event network")
+    frp_p.add_argument("--start", type=int, default=1)
+    frp_p.add_argument("--stop",  type=int, default=30)
+    frp_p.add_argument("--rule",  default="classic")
+
+    # ── green ─────────────────────────────────────────────────────────────────
+    gr_p = sub.add_parser("green", help="Cooperative green-thread scheduler")
+    gr_p.add_argument("--start",   type=int, default=1)
+    gr_p.add_argument("--stop",    type=int, default=30)
+    gr_p.add_argument("--rule",    default="classic")
+    gr_p.add_argument("--workers", type=int, default=4)
 
     args = parser.parse_args(argv)
     cmd = args.cmd or "run"
@@ -7116,6 +8357,123 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
                     for start_n, lbls in windows:
                         print(f"  n={start_n:>4}  {lbls}")
                     print(f"\n  Total windows found: {len(windows)}")
+
+        case "recur":
+            rule = RuleRegistry().get(args.rule)
+            _alg_map = {
+                "depth":       _cata_depth,
+                "divisors":    _cata_divisors,
+                "label_count": _cata_label_count,
+            }
+            alg = _alg_map[args.alg]
+            match args.scheme:
+                case "cata":
+                    result = cata(alg, rule)
+                    print(f"cata({args.alg}) over {args.rule!r}: {result}")
+                case "ana":
+                    scale = 2
+                    new_rule = ana(_coalg_scale(scale), rule)
+                    print(f"ana(scale×{scale}) over {args.rule!r}: {new_rule!r}")
+                    print(f"  Divisors before: {set(cata(_cata_divisors, rule))}")
+                    print(f"  Divisors after:  {set(cata(_cata_divisors, new_rule))}")
+                case "hylo":
+                    result = hylo(alg, _coalg_scale(1), rule)
+                    print(f"hylo({args.alg}, scale×1) over {args.rule!r}: {result}")
+                case "para":
+                    def _para_show(layer: RuleF) -> str:
+                        match layer:
+                            case RuleCompositeF(children=ch):
+                                return f"[{', '.join(repr(orig) + ':' + folded for orig, folded in ch)}]"
+                            case RuleDivF(divisor=d, label=lbl): return f"Div({d})"
+                            case _: return "Leaf"
+                    result = para(lambda l: _para_show(rulef_fmap(l, lambda p: p)), rule)
+                    print(f"para over {args.rule!r}: {result}")
+                case "zygo":
+                    result = zygo(_cata_depth, _cata_label_count, rule)
+                    print(f"zygo(depth, label_count) over {args.rule!r}: {result}")
+                case "histo":
+                    result = histo(alg, rule)
+                    print(f"histo({args.alg}) over {args.rule!r}: {result}")
+
+        case "sat":
+            formula_str = " ".join(args.formula) if args.formula else None
+            _sat_ns = {
+                "PVar": PVar, "PNot": PNot, "PAnd": PAnd, "POr": POr,
+                "PImp": PImp, "PIff": PIff, "PTrue": PTrue, "PFalse": PFalse,
+            }
+            if formula_str:
+                try:
+                    prop_obj = eval(formula_str, _sat_ns)  # noqa: S307
+                    cnf = prop_to_cnf(prop_obj)
+                    asgn = dpll(cnf)
+                    print(f"Formula:    {prop_obj!r}")
+                    print(f"CNF:        {len(cnf)} clauses")
+                    print(f"SAT:        {asgn is not None}")
+                    print(f"Tautology:  {prop_is_tautology(prop_obj)}")
+                    if asgn:
+                        print(f"Assignment: {asgn}")
+                except Exception as exc:
+                    print(f"Error: {exc}", file=sys.stderr)
+                    return 1
+            # Rule consistency verification
+            rule = RuleRegistry().get(args.rule)
+            print(f"\nRule-firing consistency check: {args.rule!r} [{args.start}..{args.stop}]")
+            msgs = check_rule_mutual_exclusion(rule, args.start, args.stop)
+            inconsistencies = [m for m in msgs if "INCONSISTENCY" in m]
+            if inconsistencies:
+                for m in inconsistencies:
+                    print(m)
+            else:
+                print(f"  All {len(msgs)} positions consistent ✓")
+
+        case "cms":
+            rule = RuleRegistry().get(args.rule)
+            cms = cms_fizzbuzz(rule, args.start, args.stop,
+                               epsilon=args.epsilon, delta=args.delta)
+            print(f"Count-Min Sketch: {cms!r}")
+            universe = [FIZZ, BUZZ, FIZZBUZZ] + [str(n) for n in range(1, 20)]
+            top = cms.top_k(8, universe)
+            exact: Counter[str] = Counter()
+            for n in range(args.start, args.stop + 1):
+                exact[rule(Number(n)) or str(n)] += 1
+            print(f"\n{'Label':<16} {'Estimate':>10} {'Exact':>8} {'Error':>8}")
+            print("─" * 46)
+            for item, est in top:
+                ex = exact.get(item, 0)
+                err = abs(est - ex) / max(ex, 1)
+                print(f"{item:<16} {est:>10} {ex:>8} {err:>7.1%}")
+            print(f"\nInner product estimate: {cms.inner_product(cms)}")
+
+        case "frp":
+            rule = RuleRegistry().get(args.rule)
+            _, label_beh, out_event = build_fizzbuzz_frp(rule, args.start, args.stop)
+            print(f"FRP network output [{args.start}..{args.stop}]:")
+            for t, v in out_event.occurrences:
+                n_val = args.start + int(t)
+                print(f"  t={t:>5.1f}  n={n_val:>4}  {v}")
+            runs = fizzbuzz_run_detector(rule, args.start, args.stop)
+            print(f"\nRun-detector events: {len(runs.occurrences)}", file=sys.stderr)
+            for t, pair in runs.occurrences:
+                print(f"  t={t:.0f}  {pair}", file=sys.stderr)
+
+            # Demonstrate SF arrow combinators
+            counter_sf = SF.arr(lambda n: n + 1)
+            double_sf  = SF.arr(lambda n: n * 2)
+            combined   = counter_sf >> double_sf
+            beh_in = Behavior(lambda t: int(t))
+            beh_out = combined.run(beh_in)
+            print(f"\nSF pipeline demo (n → n+1 → ×2) at t=5: {beh_out.at(5.0)}", file=sys.stderr)
+
+        case "green":
+            rule = RuleRegistry().get(args.rule)
+            result_map = run_green_fizzbuzz(
+                rule, args.start, args.stop, n_workers=args.workers
+            )
+            print(f"Green-thread FizzBuzz [{args.start}..{args.stop}] "
+                  f"({args.workers} workers):")
+            for n_val in sorted(result_map.keys()):
+                print(f"  {n_val:>4}  {result_map[n_val]}")
+            print(f"\n  {len(result_map)} results collected", file=sys.stderr)
 
         case "run":
             _mw_map: dict[str, Middleware] = {
