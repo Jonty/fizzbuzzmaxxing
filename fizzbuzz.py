@@ -1726,6 +1726,234 @@ def secd_demo_program(n_val: int) -> Any:
 
 
 # ===========================================================================
+# § 2j  Normalization by Evaluation  (NbE)
+# ===========================================================================
+# NbE (Berger & Schwichtenberg, 1991) computes β-normal η-long forms without
+# capture-avoiding substitution.  The trick: evaluate into a *semantic domain*
+# using the host language's native binding, then *reify* (quote) back to syntax.
+#
+# For a simply-typed lambda calculus the semantic domain is:
+#   SemFun(f)       – a Python function Sem → Sem  (eliminates β-redexes)
+#   SemBase(v)      – a base value (int, bool, str)
+#   SemNeutral(ne)  – a stuck term built on a free variable
+#
+# Reification of functions uses η-expansion:
+#   reify(TyFun(a,b), SemFun(f)) =
+#     let x = fresh_var()
+#     NbeLam(x, reify(b, f(SemNeutral(NbeVar(x)))))
+#
+# Simple type grammar shared with § 6g bidir checker:
+#   STInt | STBool | STStr | STUnit | STFun(dom, cod)
+
+@dataclasses.dataclass(frozen=True)
+class STInt:
+    def __repr__(self): return "Int"
+
+@dataclasses.dataclass(frozen=True)
+class STBool:
+    def __repr__(self): return "Bool"
+
+@dataclasses.dataclass(frozen=True)
+class STStr:
+    def __repr__(self): return "Str"
+
+@dataclasses.dataclass(frozen=True)
+class STUnit:
+    def __repr__(self): return "Unit"
+
+@dataclasses.dataclass(frozen=True)
+class STFun:
+    dom: Any
+    cod: Any
+    def __repr__(self): return f"({self.dom!r} → {self.cod!r})"
+
+SimpleType: TypeAlias = Union[STInt, STBool, STStr, STUnit, STFun]
+
+# Normal-form expression AST (distinct from SECD Expr, these are already β-normal)
+@dataclasses.dataclass(frozen=True)
+class NbeConst:
+    val: Any
+
+@dataclasses.dataclass(frozen=True)
+class NbeVar:
+    name: str
+
+@dataclasses.dataclass(frozen=True)
+class NbeLam:
+    param: str
+    body: Any  # NbeExpr
+
+@dataclasses.dataclass(frozen=True)
+class NbeApp:
+    fn: Any
+    arg: Any
+
+@dataclasses.dataclass(frozen=True)
+class NbeBinOp:
+    op: str
+    left: Any
+    right: Any
+
+@dataclasses.dataclass(frozen=True)
+class NbeIf:
+    cond: Any
+    then_: Any
+    else_: Any
+
+NbeExpr: TypeAlias = Union[NbeConst, NbeVar, NbeLam, NbeApp, NbeBinOp, NbeIf]
+
+# Semantic domain
+@dataclasses.dataclass
+class SemBase:
+    val: Any
+
+@dataclasses.dataclass
+class SemFun:
+    fn: Callable  # Sem → Sem
+
+@dataclasses.dataclass
+class SemNeutral:
+    ne: NbeExpr  # the stuck expression
+
+
+def _nbe_fresh(counter: list) -> str:
+    """Generate a fresh variable name."""
+    n = counter[0]
+    counter[0] += 1
+    return f"z{n}"
+
+
+def nbe_eval(expr: Any, env: dict[str, Any]) -> Any:
+    """Evaluate a SECD expression into the NbE semantic domain."""
+    match expr:
+        case EConst(val=v):
+            return SemBase(v)
+        case EVar(name=x):
+            if x not in env:
+                return SemNeutral(NbeVar(x))
+            return env[x]
+        case ELam(param=p, body=b):
+            # Host lambda closes over env — no substitution needed
+            captured = dict(env)
+            return SemFun(lambda v, _p=p, _b=b, _e=captured: nbe_eval(_b, {**_e, _p: v}))
+        case EApp(fn=f, arg=a):
+            sf = nbe_eval(f, env)
+            sa = nbe_eval(a, env)
+            match sf:
+                case SemFun(fn=fn):
+                    return fn(sa)
+                case SemNeutral(ne=ne):
+                    return SemNeutral(NbeApp(ne, nbe_reify_any(sa)))
+                case _:
+                    return SemBase(None)
+        case EIf(cond=c, then_=t, else_=e):
+            sc = nbe_eval(c, env)
+            match sc:
+                case SemBase(val=True):  return nbe_eval(t, env)
+                case SemBase(val=False): return nbe_eval(e, env)
+                case SemNeutral(ne=ne):
+                    return SemNeutral(NbeIf(ne, nbe_reify_any(nbe_eval(t, env)),
+                                           nbe_reify_any(nbe_eval(e, env))))
+                case _: return nbe_eval(t, env)
+        case EBinOp(op=op, left=l, right=r):
+            sl = nbe_eval(l, env)
+            sr = nbe_eval(r, env)
+            match (sl, sr):
+                case (SemBase(val=a), SemBase(val=b)):
+                    match op:
+                        case "add": return SemBase(a + b)
+                        case "sub": return SemBase(a - b)
+                        case "mul": return SemBase(a * b)
+                        case "mod": return SemBase(a % b)
+                        case "eq":  return SemBase(a == b)
+                        case "lt":  return SemBase(a < b)
+                        case "and": return SemBase(bool(a) and bool(b))
+                        case "or":  return SemBase(bool(a) or bool(b))
+                        case _:     return SemBase(None)
+                case _:
+                    return SemNeutral(NbeBinOp(op, nbe_reify_any(sl), nbe_reify_any(sr)))
+        case ELet(var=x, val=v, body=b):
+            return nbe_eval(EApp(ELam(x, b), v), env)
+        case EFizzBuzz():
+            return SemFun(lambda v: SemBase(None))  # rule not available at normalization time
+        case _:
+            return SemBase(None)
+
+
+def nbe_reify_any(sem: Any) -> NbeExpr:
+    """Reify a semantic value without a type annotation (base-case only)."""
+    match sem:
+        case SemBase(val=v):   return NbeConst(v)
+        case SemNeutral(ne=ne): return ne
+        case SemFun():          return NbeConst("<fn>")
+        case _:                 return NbeConst(None)
+
+
+def nbe_reify(ty: SimpleType, sem: Any, ctr: list) -> NbeExpr:
+    """Typed reification — performs η-expansion at function types."""
+    match ty:
+        case STFun(dom=a, cod=b):
+            x = _nbe_fresh(ctr)
+            # Apply the semantic function to a fresh neutral variable
+            result_sem = (sem.fn(SemNeutral(NbeVar(x)))
+                          if isinstance(sem, SemFun)
+                          else SemNeutral(NbeApp(nbe_reify_any(sem), NbeVar(x))))
+            return NbeLam(x, nbe_reify(b, result_sem, ctr))
+        case STInt() | STBool() | STStr() | STUnit():
+            match sem:
+                case SemBase(val=v):    return NbeConst(v)
+                case SemNeutral(ne=ne): return ne
+                case _:                 return NbeConst(None)
+        case _:
+            return nbe_reify_any(sem)
+
+
+def nbe_normalize(expr: Any, ty: SimpleType,
+                  env: dict[str, Any] | None = None) -> NbeExpr:
+    """Full pipeline: eval then reify."""
+    sem = nbe_eval(expr, env or {})
+    return nbe_reify(ty, sem, [0])
+
+
+def nbe_pretty(ne: NbeExpr, prec: int = 0) -> str:
+    """Pretty-print a normal-form expression."""
+    match ne:
+        case NbeConst(val=v):      return repr(v)
+        case NbeVar(name=x):       return x
+        case NbeLam(param=p, body=b):
+            s = f"λ{p}. {nbe_pretty(b, 0)}"
+            return f"({s})" if prec > 0 else s
+        case NbeApp(fn=f, arg=a):
+            s = f"{nbe_pretty(f, 1)} {nbe_pretty(a, 2)}"
+            return f"({s})" if prec > 1 else s
+        case NbeBinOp(op=op, left=l, right=r):
+            return f"({nbe_pretty(l)} {op} {nbe_pretty(r)})"
+        case NbeIf(cond=c, then_=t, else_=e):
+            return f"if {nbe_pretty(c)} then {nbe_pretty(t)} else {nbe_pretty(e)}"
+        case _:
+            return repr(ne)
+
+
+def nbe_fizzbuzz_demo(n_val: int) -> tuple[NbeExpr, NbeExpr]:
+    """Normalize two expressions and return their normal forms."""
+    # Expression 1: (λf. λg. λx. f (g x)) identity (λn. n+1) 41
+    identity = ELam("x", EVar("x"))
+    inc = ELam("n", EBinOp("add", EVar("n"), EConst(1)))
+    compose = ELam("f", ELam("g", ELam("x", EApp(EVar("f"), EApp(EVar("g"), EVar("x"))))))
+    e1 = EApp(EApp(EApp(compose, identity), inc), EConst(n_val))
+    nf1 = nbe_normalize(e1, STInt())
+
+    # Expression 2: (λb. if b then "yes" else "no") (3 mod 3 == 0)
+    e2 = EApp(
+        ELam("b", EIf(EVar("b"), EConst("yes"), EConst("no"))),
+        EBinOp("eq", EBinOp("mod", EConst(n_val), EConst(3)), EConst(0)),
+    )
+    nf2 = nbe_normalize(e2, STStr())
+
+    return nf1, nf2
+
+
+# ===========================================================================
 # § 3  Event bus
 # ===========================================================================
 
@@ -3125,6 +3353,205 @@ def find_rule_mgu(rule_names: list[str]) -> "Result[tuple[Subst, list[str]], str
             else:
                 results.append(f"  {n1} ↔ {n2}: no unifier — {res.error}")
     return Ok((combined_subst, results))
+
+
+# ===========================================================================
+# § 6g  Bidirectional type checker  (synthesise ↔ check for mini-lambda)
+# ===========================================================================
+# Bidirectional type checking (Pierce & Turner, 2000) splits type inference
+# into two modes:
+#   infer(expr, ctx) → Result[SimpleType, str]   – *synthesise* a type
+#   check(expr, ty, ctx) → Result[None, str]     – *verify* an expected type
+#
+# The key rule: lambda abstractions *cannot* be inferred (they need an
+# annotation or a check-mode type), but can always be checked against a
+# function type.  All other forms are inferrable.
+#
+# We type the SECD mini-lambda (§ 2i/§ 2j) using the SimpleType grammar
+# defined in § 2j (STInt, STBool, STStr, STUnit, STFun).
+#
+#   EConst(int)         : Int
+#   EConst(bool)        : Bool
+#   EConst(str)         : Str
+#   EConst(None)        : Unit
+#   EVar(x)             : ctx[x]
+#   EApp(f, a)          : infer f → Fun(dom,cod), check a : dom  ⊢  cod
+#   EBinOp(arith,…)     : Int × Int → Int
+#   EBinOp(cmp,…)       : Int × Int → Bool
+#   EBinOp(logic,…)     : Bool × Bool → Bool
+#   EFizzBuzz()         : Fun(Int, Str)
+#   ELam(p,b) [check]   : Fun(dom,cod) ⊢ check b:cod in ctx+{p:dom}
+#   EIf(c,t,e) [check]  : check c:Bool, check t:ty, check e:ty
+#   ELet(x,v,b)         : infer v → tv, then check/infer b in ctx+{x:tv}
+
+BdCtx: TypeAlias = dict[str, SimpleType]
+
+_ARITH_OPS  = frozenset({"add", "sub", "mul", "mod"})
+_CMP_OPS    = frozenset({"eq", "lt"})
+_LOGIC_OPS  = frozenset({"and", "or"})
+
+
+def bidir_infer(expr: Any, ctx: BdCtx) -> "Result[SimpleType, str]":
+    """Synthesise the type of expr in context ctx."""
+    match expr:
+        case EConst(val=v):
+            if isinstance(v, bool):     return Ok(STBool())
+            if isinstance(v, int):      return Ok(STInt())
+            if isinstance(v, str):      return Ok(STStr())
+            if v is None:               return Ok(STUnit())
+            return Ok(STStr())  # fallback
+        case EVar(name=x):
+            if x in ctx:
+                return Ok(ctx[x])
+            return Err(f"Unbound variable: {x!r}")
+        case EApp(fn=f, arg=a):
+            r_fn = bidir_infer(f, ctx)
+            if not r_fn.is_ok():
+                return r_fn
+            fn_ty = r_fn.unwrap()
+            if not isinstance(fn_ty, STFun):
+                return Err(f"Expected function type, got {fn_ty!r}")
+            r_arg = bidir_check(a, fn_ty.dom, ctx)
+            if not r_arg.is_ok():
+                return Err(f"Argument type error: {r_arg.error}")
+            return Ok(fn_ty.cod)
+        case EBinOp(op=op, left=l, right=r):
+            if op in _ARITH_OPS:
+                for side, e in (("left", l), ("right", r)):
+                    res = bidir_check(e, STInt(), ctx)
+                    if not res.is_ok():
+                        return Err(f"BinOp {op!r} {side}: {res.error}")
+                return Ok(STInt())
+            elif op in _CMP_OPS:
+                for side, e in (("left", l), ("right", r)):
+                    res = bidir_check(e, STInt(), ctx)
+                    if not res.is_ok():
+                        return Err(f"BinOp {op!r} {side}: {res.error}")
+                return Ok(STBool())
+            elif op in _LOGIC_OPS:
+                for side, e in (("left", l), ("right", r)):
+                    res = bidir_check(e, STBool(), ctx)
+                    if not res.is_ok():
+                        return Err(f"BinOp {op!r} {side}: {res.error}")
+                return Ok(STBool())
+            else:
+                return Err(f"Unknown operator {op!r}")
+        case EFizzBuzz():
+            return Ok(STFun(STInt(), STStr()))
+        case ELam():
+            return Err("Cannot infer type of lambda — use check mode or annotate")
+        case EIf(cond=c, then_=t, else_=e):
+            r_c = bidir_check(c, STBool(), ctx)
+            if not r_c.is_ok():
+                return Err(f"If condition: {r_c.error}")
+            r_t = bidir_infer(t, ctx)
+            if not r_t.is_ok():
+                return r_t
+            r_e = bidir_check(e, r_t.unwrap(), ctx)
+            if not r_e.is_ok():
+                return Err(f"If branches must have same type: {r_e.error}")
+            return r_t
+        case ELet(var=x, val=v, body=b):
+            r_v = bidir_infer(v, ctx)
+            if not r_v.is_ok():
+                return r_v
+            return bidir_infer(b, {**ctx, x: r_v.unwrap()})
+        case _:
+            return Err(f"Unknown expression {expr!r}")
+
+
+def bidir_check(expr: Any, ty: SimpleType, ctx: BdCtx) -> "Result[None, str]":
+    """Verify expr has type ty in context ctx."""
+    match expr:
+        case ELam(param=p, body=b):
+            if not isinstance(ty, STFun):
+                return Err(f"Lambda expects function type, got {ty!r}")
+            return bidir_check(b, ty.cod, {**ctx, p: ty.dom})
+        case EIf(cond=c, then_=t, else_=e):
+            r_c = bidir_check(c, STBool(), ctx)
+            if not r_c.is_ok():
+                return Err(f"If condition: {r_c.error}")
+            r_t = bidir_check(t, ty, ctx)
+            if not r_t.is_ok():
+                return Err(f"If then-branch: {r_t.error}")
+            r_e = bidir_check(e, ty, ctx)
+            if not r_e.is_ok():
+                return Err(f"If else-branch: {r_e.error}")
+            return Ok(None)
+        case ELet(var=x, val=v, body=b):
+            r_v = bidir_infer(v, ctx)
+            if not r_v.is_ok():
+                return r_v
+            return bidir_check(b, ty, {**ctx, x: r_v.unwrap()})
+        case _:
+            # Fall through to infer-then-compare
+            r = bidir_infer(expr, ctx)
+            if not r.is_ok():
+                return r
+            inf = r.unwrap()
+            if inf == ty:
+                return Ok(None)
+            return Err(f"Type mismatch: expected {ty!r}, got {inf!r}")
+
+
+def bidir_check_expr(expr: Any, ty: SimpleType,
+                     ctx: BdCtx | None = None) -> "Result[SimpleType, str]":
+    """Convenience: check then return the type on success."""
+    res = bidir_check(expr, ty, ctx or {})
+    if res.is_ok():
+        return Ok(ty)
+    return res
+
+
+def bidir_typecheck_program(exprs: list[tuple[str, Any, SimpleType | None]],
+                             ctx: BdCtx | None = None) -> list[tuple[str, str]]:
+    """
+    Type-check a list of (name, expr, optional_expected_type).
+    Returns (name, result_str) pairs.
+    """
+    base_ctx = dict(ctx or {})
+    results = []
+    for name, expr, expected_ty in exprs:
+        if expected_ty is not None:
+            r = bidir_check_expr(expr, expected_ty, base_ctx)
+        else:
+            r = bidir_infer(expr, base_ctx)
+        if r.is_ok():
+            results.append((name, f"✓  {r.unwrap()!r}"))
+        else:
+            results.append((name, f"✗  {r.error}"))
+    return results
+
+
+def _bidir_fizzbuzz_suite() -> list[tuple[str, Any, "SimpleType | None"]]:
+    """A suite of well- and ill-typed FizzBuzz expressions for the type checker."""
+    return [
+        ("fizzbuzz(15)",
+         EApp(EFizzBuzz(), EConst(15)),
+         STStr()),
+        ("fizzbuzz(15) [infer]",
+         EApp(EFizzBuzz(), EConst(15)),
+         None),
+        ("3 mod 3 == 0",
+         EBinOp("eq", EBinOp("mod", EConst(3), EConst(3)), EConst(0)),
+         STBool()),
+        ("λn. n mod 15",
+         ELam("n", EBinOp("mod", EVar("n"), EConst(15))),
+         STFun(STInt(), STInt())),
+        ("compose id (+1) : Int→Int",
+         ELam("x", EBinOp("add", EVar("x"), EConst(1))),
+         STFun(STInt(), STInt())),
+        ("ill-typed: 3 + True",
+         EBinOp("add", EConst(3), EConst(True)),
+         STInt()),
+        ("ill-typed: fizzbuzz applied to string",
+         EApp(EFizzBuzz(), EConst("hello")),
+         STStr()),
+        ("let f = λn. n*2 in f 7",
+         ELet("f", ELam("n", EBinOp("mul", EVar("n"), EConst(2))),
+              EApp(EVar("f"), EConst(7))),
+         STInt()),
+    ]
 
 
 # ===========================================================================
@@ -4598,6 +5025,179 @@ def skip_list_label_index(rule: Any, start: int, stop: int) -> dict[str, SkipLis
             index[label] = SkipList()
         index[label].insert(n, n)
     return index
+
+
+# ===========================================================================
+# § 10f  Treap  (randomised BST with heap-ordered priorities)
+# ===========================================================================
+# A treap (Aragon & Seidel, 1989) is a BST on keys and a max-heap on random
+# priorities.  The random priorities make the expected tree height O(log n)
+# without explicit rebalancing.
+#
+# This implementation is *purely functional* (immutable nodes).  The two
+# primitive operations are:
+#   treap_split(t, key) → (left, right)  – O(log n)  keys<key | keys≥key
+#   treap_merge(l, r)   → t              – O(log n)  all keys(l) < all keys(r)
+#
+# Every other operation is expressed as split + singleton + merge:
+#   insert(t, k, v) = merge(merge(split(t,k).left, singleton(k,v)), split(t,k).right)
+#   delete(t, k)    = merge(split(t,k).left, split(t,k+ε).right)
+#
+# Because priorities are random, the expected depth at any key is O(log n),
+# giving O(log n) expected time for all dictionary operations.
+
+@dataclasses.dataclass(frozen=True)
+class _TreapNode:
+    key: Any
+    value: Any
+    priority: float
+    left: Any   # _TreapNode | None
+    right: Any  # _TreapNode | None
+
+_TREAP_EMPTY: "_TreapNode | None" = None
+
+
+def _treap_node(key: Any, value: Any,
+                left: Any = None, right: Any = None) -> _TreapNode:
+    return _TreapNode(key, value, _random.random(), left, right)
+
+
+def treap_split(t: Any, key: Any) -> tuple[Any, Any]:
+    """Split into (tree with keys < key, tree with keys >= key)."""
+    if t is None:
+        return None, None
+    if t.key < key:
+        left, right = treap_split(t.right, key)
+        return _TreapNode(t.key, t.value, t.priority, t.left, left), right
+    else:
+        left, right = treap_split(t.left, key)
+        return left, _TreapNode(t.key, t.value, t.priority, right, t.right)
+
+
+def treap_merge(l: Any, r: Any) -> Any:
+    """Merge two treaps where all keys(l) < all keys(r)."""
+    if l is None: return r
+    if r is None: return l
+    if l.priority > r.priority:
+        return _TreapNode(l.key, l.value, l.priority, l.left, treap_merge(l.right, r))
+    else:
+        return _TreapNode(r.key, r.value, r.priority, treap_merge(l, r.left), r.right)
+
+
+def treap_insert(t: Any, key: Any, value: Any) -> Any:
+    left, right = treap_split(t, key)
+    # Remove existing key by splitting right again at key+epsilon
+    _, right2 = treap_split(right, key)
+    right3 = treap_split(right, key)[1]  # keys strictly > key
+    # Actually: split(t, key) gives <key and ≥key; need to also split off ==key
+    # Re-do properly:
+    left2, right_ge = treap_split(t, key)
+    _, right_gt = treap_split(right_ge, key)  # hack: won't work for non-int
+    # Simpler: just merge with a fresh singleton, overwriting equals
+    node = _TreapNode(key, value, _random.random(), None, None)
+    left3, _ = treap_split(t, key)
+    _, right4 = treap_split(t, key)
+    # right4 may include key; split it at key+epsilon
+    # For simplicity, explicitly handle equality
+    return _treap_insert_impl(t, key, value)
+
+
+def _treap_insert_impl(t: Any, key: Any, value: Any) -> Any:
+    if t is None:
+        return _TreapNode(key, value, _random.random(), None, None)
+    if key == t.key:
+        return _TreapNode(key, value, t.priority, t.left, t.right)
+    if key < t.key:
+        new_left = _treap_insert_impl(t.left, key, value)
+        node = _TreapNode(t.key, t.value, t.priority, new_left, t.right)
+        # Bubble up if new_left has higher priority
+        if new_left is not None and new_left.priority > node.priority:
+            return _TreapNode(new_left.key, new_left.value, new_left.priority,
+                              new_left.left,
+                              _TreapNode(node.key, node.value, node.priority,
+                                         new_left.right, node.right))
+        return node
+    else:
+        new_right = _treap_insert_impl(t.right, key, value)
+        node = _TreapNode(t.key, t.value, t.priority, t.left, new_right)
+        if new_right is not None and new_right.priority > node.priority:
+            return _TreapNode(new_right.key, new_right.value, new_right.priority,
+                              _TreapNode(node.key, node.value, node.priority,
+                                         node.left, new_right.left),
+                              new_right.right)
+        return node
+
+
+def treap_search(t: Any, key: Any) -> "Result[Any, str]":
+    while t is not None:
+        if key == t.key:   return Ok(t.value)
+        elif key < t.key:  t = t.left
+        else:              t = t.right
+    return Err(f"treap: key {key!r} not found")
+
+
+def treap_delete(t: Any, key: Any) -> Any:
+    """Delete key from treap (no-op if absent)."""
+    if t is None:
+        return None
+    if key == t.key:
+        return treap_merge(t.left, t.right)
+    if key < t.key:
+        return _TreapNode(t.key, t.value, t.priority,
+                          treap_delete(t.left, key), t.right)
+    return _TreapNode(t.key, t.value, t.priority,
+                      t.left, treap_delete(t.right, key))
+
+
+def treap_to_sorted_list(t: Any) -> list[tuple[Any, Any]]:
+    if t is None: return []
+    return treap_to_sorted_list(t.left) + [(t.key, t.value)] + treap_to_sorted_list(t.right)
+
+
+def treap_range_query(t: Any, lo: Any, hi: Any) -> list[tuple[Any, Any]]:
+    """Return all (key, value) pairs with lo <= key <= hi."""
+    results: list = []
+    stack = [t]
+    while stack:
+        node = stack.pop()
+        if node is None: continue
+        if lo <= node.key <= hi:
+            results.append((node.key, node.value))
+        if node.key > lo:
+            stack.append(node.left)
+        if node.key < hi:
+            stack.append(node.right)
+    return sorted(results)
+
+
+def treap_height(t: Any) -> int:
+    if t is None: return 0
+    return 1 + max(treap_height(t.left), treap_height(t.right))
+
+
+def treap_size(t: Any) -> int:
+    if t is None: return 0
+    return 1 + treap_size(t.left) + treap_size(t.right)
+
+
+def build_fizzbuzz_treap(rule: Any, start: int, stop: int) -> Any:
+    """Build a treap keyed by n with FizzBuzz label as value."""
+    t = _TREAP_EMPTY
+    for n in range(start, stop + 1):
+        label = rule(Number(n)) or str(n)
+        t = _treap_insert_impl(t, n, label)
+    return t
+
+
+def treap_label_index(rule: Any, start: int, stop: int) -> Any:
+    """Build a treap keyed by label with lists of n values."""
+    t = _TREAP_EMPTY
+    for n in range(start, stop + 1):
+        label = rule(Number(n)) or str(n)
+        existing = treap_search(t, label)
+        ns = existing.unwrap() if existing.is_ok() else []
+        t = _treap_insert_impl(t, label, ns + [n])
+    return t
 
 
 # ===========================================================================
@@ -6396,6 +6996,180 @@ def fizzbuzz_finger_tree(rule: Any, start: int, stop: int) -> FingerTree:
 
 
 # ===========================================================================
+# § 13j  Rope  (binary tree for O(1) concat, O(log n) index and split)
+# ===========================================================================
+# A rope (Boehm, Atkinson & Plass, 1995) represents a string as a balanced
+# binary tree of short leaf strings.  Key properties:
+#   concat(a, b)   O(1) — just create an internal node
+#   length         O(1) — cached at every node
+#   index(r, i)    O(log n) — traverse the tree by accumulated lengths
+#   split(r, i)    O(log n) — split at character position i
+#   to_str(r)      O(n)  — materialise by DFS
+#
+# This makes ropes ideal for large strings with frequent edits/splits.
+# We apply them to build the FizzBuzz output as a rope and then perform
+# substring queries without materialising the whole string.
+
+@dataclasses.dataclass(frozen=True)
+class RopeLeaf:
+    text: str
+
+    @property
+    def length(self) -> int:
+        return len(self.text)
+
+@dataclasses.dataclass(frozen=True)
+class RopeConcat:
+    left: Any   # Rope
+    right: Any  # Rope
+    length: int
+
+Rope: TypeAlias = Union[RopeLeaf, RopeConcat]
+
+_ROPE_MAX_LEAF = 64  # rebalance leaves larger than this
+
+
+def rope_length(r: Rope) -> int:
+    match r:
+        case RopeLeaf(text=t):   return len(t)
+        case RopeConcat(length=n): return n
+
+
+def rope_concat(a: Rope, b: Rope) -> Rope:
+    """O(1) concatenation."""
+    if rope_length(a) == 0: return b
+    if rope_length(b) == 0: return a
+    return RopeConcat(a, b, rope_length(a) + rope_length(b))
+
+
+def rope_of(s: str) -> Rope:
+    """Build a rope from a string, splitting into leaves of bounded size."""
+    if len(s) <= _ROPE_MAX_LEAF:
+        return RopeLeaf(s)
+    mid = len(s) // 2
+    return rope_concat(rope_of(s[:mid]), rope_of(s[mid:]))
+
+
+def rope_to_str(r: Rope) -> str:
+    """O(n) materialisation via DFS."""
+    parts: list[str] = []
+    stack: list[Rope] = [r]
+    while stack:
+        node = stack.pop()
+        match node:
+            case RopeLeaf(text=t):
+                parts.append(t)
+            case RopeConcat(left=l, right=r2):
+                stack.append(r2)
+                stack.append(l)
+    return "".join(parts)
+
+
+def rope_index(r: Rope, i: int) -> str:
+    """O(log n) single-character access."""
+    while True:
+        match r:
+            case RopeLeaf(text=t):
+                return t[i]
+            case RopeConcat(left=l, right=rv):
+                ll = rope_length(l)
+                if i < ll:
+                    r = l
+                else:
+                    i -= ll
+                    r = rv
+
+
+def rope_split(r: Rope, i: int) -> tuple[Rope, Rope]:
+    """Split rope at character position i: (r[:i], r[i:])."""
+    if i <= 0:
+        return RopeLeaf(""), r
+    if i >= rope_length(r):
+        return r, RopeLeaf("")
+    match r:
+        case RopeLeaf(text=t):
+            return RopeLeaf(t[:i]), RopeLeaf(t[i:])
+        case RopeConcat(left=l, right=rv):
+            ll = rope_length(l)
+            if i <= ll:
+                l1, l2 = rope_split(l, i)
+                return l1, rope_concat(l2, rv)
+            else:
+                r1, r2 = rope_split(rv, i - ll)
+                return rope_concat(l, r1), r2
+
+
+def rope_slice(r: Rope, lo: int, hi: int) -> Rope:
+    """Substring rope[lo:hi]."""
+    _, right = rope_split(r, lo)
+    left, _ = rope_split(right, hi - lo)
+    return left
+
+
+def rope_lines(r: Rope) -> list[str]:
+    """Split the rope into lines."""
+    return rope_to_str(r).splitlines()
+
+
+def rope_depth(r: Rope) -> int:
+    """Maximum tree depth (indicates balance quality)."""
+    match r:
+        case RopeLeaf():              return 1
+        case RopeConcat(left=l, right=rv): return 1 + max(rope_depth(l), rope_depth(rv))
+
+
+def rope_rebalance(r: Rope) -> Rope:
+    """Rebuild a balanced rope from the leaf texts."""
+    leaves = [t for t in _rope_collect_leaves(r) if t]
+    if not leaves:
+        return RopeLeaf("")
+    return _rope_from_leaves(leaves, 0, len(leaves))
+
+
+def _rope_collect_leaves(r: Rope) -> list[str]:
+    stack: list[Rope] = [r]
+    out: list[str] = []
+    while stack:
+        node = stack.pop()
+        match node:
+            case RopeLeaf(text=t): out.append(t)
+            case RopeConcat(left=l, right=rv): stack.append(rv); stack.append(l)
+    return out
+
+
+def _rope_from_leaves(leaves: list[str], lo: int, hi: int) -> Rope:
+    if hi - lo == 1:
+        return RopeLeaf(leaves[lo])
+    mid = (lo + hi) // 2
+    return rope_concat(_rope_from_leaves(leaves, lo, mid),
+                       _rope_from_leaves(leaves, mid, hi))
+
+
+def fizzbuzz_rope(rule: Any, start: int, stop: int,
+                  sep: str = "\n") -> Rope:
+    """Build a rope from the FizzBuzz output lines [start..stop]."""
+    r: Rope = RopeLeaf("")
+    for n in range(start, stop + 1):
+        label = rule(Number(n)) or str(n)
+        line = rope_of(label + sep)
+        r = rope_concat(r, line)
+    return r
+
+
+def rope_stats(r: Rope) -> dict[str, Any]:
+    depth = rope_depth(r)
+    length = rope_length(r)
+    # count leaves
+    leaves = _rope_collect_leaves(r)
+    return {
+        "total_length": length,
+        "num_leaves": len(leaves),
+        "depth": depth,
+        "avg_leaf_len": length / max(len(leaves), 1),
+    }
+
+
+# ===========================================================================
 # § 14  Pipeline state machine
 # ===========================================================================
 
@@ -8187,6 +8961,208 @@ def xfb_run_io(rule: Any, start: int, stop: int, sink: "OutputSink") -> None:
 
 
 # ===========================================================================
+# § 19i  Probabilistic programming  (sampling / measure monad)
+# ===========================================================================
+# The *sampling monad* (also called the Giry monad discretised to sampling)
+# represents probability distributions as composable samplers.
+#
+#   Sampler[A]  ≅  () → A
+#
+# Monad operations:
+#   pure(v)         — point distribution at v
+#   bind(m, f)      — sample from m, pass result to f, sample from f's output
+#   map(m, f)       — transform samples by f
+#
+# Primitive distributions:
+#   uniform(items)  — uniform discrete distribution
+#   bernoulli(p)    — Bernoulli(p) → bool
+#   geometric(p)    — Geometric(p) → int  (number of trials until first success)
+#   categorical(ws) — weighted categorical (items with weights)
+#
+# Inference via rejection sampling:
+#   condition(pred, m) — filter samples from m until pred holds
+#
+# Queries:
+#   estimate(m, pred, n)   — P(pred | m) by frequency
+#   expectation(m, f, n)   — E[f(X)] where X ~ m
+#   histogram(m, n)        — empirical frequency table
+#   credible_interval(m, alpha, n)  — (lo, hi) quantile interval
+
+class Sampler(Generic[T]):
+    """A probability distribution encoded as a callable sampler."""
+
+    def __init__(self, fn: Callable[[], T]) -> None:
+        self._fn = fn
+
+    def sample(self) -> T:
+        return self._fn()
+
+    # ── monad interface ────────────────────────────────────────────────────
+
+    @staticmethod
+    def pure(v: T) -> "Sampler[T]":
+        return Sampler(lambda: v)
+
+    def map(self, f: Callable[[T], Any]) -> "Sampler[Any]":
+        return Sampler(lambda: f(self.sample()))
+
+    def bind(self, f: Callable[[T], "Sampler[Any]"]) -> "Sampler[Any]":
+        return Sampler(lambda: f(self.sample()).sample())
+
+    def __or__(self, f: Callable) -> "Sampler[Any]":
+        return self.bind(f)
+
+    # ── sampling utilities ─────────────────────────────────────────────────
+
+    def sample_n(self, n: int) -> list[T]:
+        return [self.sample() for _ in range(n)]
+
+    def estimate(self, pred: Callable[[T], bool], n: int = 2000) -> float:
+        return sum(1 for _ in range(n) if pred(self.sample())) / n
+
+    def expectation(self, f: Callable[[T], float], n: int = 2000) -> float:
+        return sum(f(self.sample()) for _ in range(n)) / n
+
+    def histogram(self, n: int = 2000) -> "Counter[Any]":
+        return Counter(self.sample() for _ in range(n))
+
+    def credible_interval(self, alpha: float = 0.05,
+                          n: int = 2000) -> tuple[Any, Any]:
+        """Empirical (alpha/2, 1-alpha/2) quantile interval over numeric samples."""
+        samples = sorted(self.sample_n(n))
+        lo_i = int(len(samples) * alpha / 2)
+        hi_i = int(len(samples) * (1 - alpha / 2))
+        return samples[lo_i], samples[min(hi_i, len(samples) - 1)]
+
+    def condition(self, pred: Callable[[T], bool],
+                  max_tries: int = 100_000) -> "Sampler[T]":
+        """Rejection sampling: keep drawing until pred holds."""
+        def _sample() -> T:
+            for _ in range(max_tries):
+                v = self.sample()
+                if pred(v):
+                    return v
+            raise RuntimeError("Sampler.condition: exhausted max_tries")
+        return Sampler(_sample)
+
+    def __repr__(self) -> str:
+        return "Sampler(...)"
+
+
+# ── primitive distributions ───────────────────────────────────────────────
+
+def prob_uniform(items: list) -> "Sampler[Any]":
+    return Sampler(lambda: _random.choice(items))
+
+
+def prob_bernoulli(p: float) -> "Sampler[bool]":
+    return Sampler(lambda: _random.random() < p)
+
+
+def prob_geometric(p: float) -> "Sampler[int]":
+    def _sample() -> int:
+        k = 1
+        while _random.random() > p:
+            k += 1
+        return k
+    return Sampler(_sample)
+
+
+def prob_categorical(items: list, weights: list[float]) -> "Sampler[Any]":
+    """Weighted categorical: items[i] chosen with probability weights[i]/sum."""
+    total = sum(weights)
+    cdf = []
+    acc = 0.0
+    for w in weights:
+        acc += w / total
+        cdf.append(acc)
+    def _sample() -> Any:
+        r = _random.random()
+        for item, threshold in zip(items, cdf):
+            if r <= threshold:
+                return item
+        return items[-1]
+    return Sampler(_sample)
+
+
+def prob_normal_approx(mean: float, std: float) -> "Sampler[float]":
+    """Box–Muller normal approximation."""
+    import math as _m
+    def _sample() -> float:
+        u1 = _random.random()
+        u2 = _random.random()
+        z = _m.sqrt(-2 * _m.log(max(u1, 1e-10))) * _m.cos(2 * _m.pi * u2)
+        return mean + std * z
+    return Sampler(_sample)
+
+
+# ── FizzBuzz probabilistic queries ───────────────────────────────────────────
+
+def prob_fizzbuzz_sampler(rule: Any, lo: int, hi: int) -> "Sampler[tuple[int, Any]]":
+    """Sample a uniform random n in [lo,hi] and its FizzBuzz label."""
+    ns = list(range(lo, hi + 1))
+    def _sample() -> tuple[int, Any]:
+        n = _random.choice(ns)
+        return n, rule(Number(n))
+    return Sampler(_sample)
+
+
+def prob_estimate_label(rule: Any, lo: int, hi: int,
+                        label: str, n_samples: int = 5000) -> float:
+    """Estimate P(label=X) over uniform n ~ [lo, hi]."""
+    sampler = prob_fizzbuzz_sampler(rule, lo, hi)
+    return sampler.estimate(lambda pair: pair[1] == label, n_samples)
+
+
+def prob_conditional_distribution(rule: Any, lo: int, hi: int,
+                                   given_label: str,
+                                   n_samples: int = 5000) -> "Counter[int]":
+    """Empirical distribution of n mod 15 given a specific label."""
+    sampler = prob_fizzbuzz_sampler(rule, lo, hi).condition(
+        lambda pair: pair[1] == given_label
+    )
+    return Counter(n % 15 for n, _ in sampler.sample_n(n_samples))
+
+
+def prob_run_fizzbuzz_queries(rule: Any, lo: int, hi: int,
+                               n_samples: int = 3000) -> list[str]:
+    """Run a battery of probabilistic queries and return result lines."""
+    sampler = prob_fizzbuzz_sampler(rule, lo, hi)
+    lines = []
+
+    p_fizz     = sampler.estimate(lambda p: p[1] == "Fizz",     n_samples)
+    p_buzz     = sampler.estimate(lambda p: p[1] == "Buzz",     n_samples)
+    p_fizzbuzz = sampler.estimate(lambda p: p[1] == "FizzBuzz", n_samples)
+    p_labelled = sampler.estimate(lambda p: p[1] is not None,   n_samples)
+
+    lines.append(f"  Estimates over uniform n ~ [{lo}, {hi}] ({n_samples} samples):")
+    lines.append(f"    P(Fizz)      = {p_fizz:.4f}  (theory ≈ {4/15:.4f})")
+    lines.append(f"    P(Buzz)      = {p_buzz:.4f}  (theory ≈ {2/15:.4f})")
+    lines.append(f"    P(FizzBuzz)  = {p_fizzbuzz:.4f}  (theory ≈ {1/15:.4f})")
+    lines.append(f"    P(labelled)  = {p_labelled:.4f}  (theory ≈ {7/15:.4f})")
+
+    # Conditional: E[n] given Fizz
+    cond_fizz = sampler.condition(lambda p: p[1] == "Fizz")
+    e_n_given_fizz = cond_fizz.expectation(lambda p: p[0], n_samples // 5)
+    e_n_mid = (lo + hi) / 2
+    lines.append(f"\n  E[n | Fizz]  = {e_n_given_fizz:.1f}  (E[n] unconditional ≈ {e_n_mid:.1f})")
+
+    # Credible interval for n | FizzBuzz
+    cond_fb = sampler.condition(lambda p: p[1] == "FizzBuzz")
+    ci_lo, ci_hi = cond_fb.map(lambda p: p[0]).credible_interval(0.05, 500)
+    lines.append(f"  95% CI for n | FizzBuzz: [{ci_lo}, {ci_hi}]")
+
+    # Histogram of labels
+    hist = sampler.map(lambda p: p[1] or "<n>").histogram(n_samples)
+    lines.append(f"\n  Label histogram (top 5):")
+    for lbl, cnt in hist.most_common(5):
+        bar = "█" * int(cnt / n_samples * 60)
+        lines.append(f"    {str(lbl):<12} {cnt:>5}  {bar}")
+
+    return lines
+
+
+# ===========================================================================
 # § 20  Interactive REPL
 # ===========================================================================
 
@@ -8702,6 +9678,11 @@ def run_repl() -> None:
                     "  cms                          — Count-Min Sketch frequency estimation\n"
                     "  frp                          — arrowized FRP Behavior/Event network\n"
                     "  green                        — cooperative green-thread FizzBuzz\n"
+                    "  nbe [n]                      — normalization by evaluation (NbE)\n"
+                    "  typecheck                    — bidirectional type checker for mini-lambda\n"
+                    "  treap                        — treap (randomised BST) operations\n"
+                    "  rope                         — rope string tree (split/concat/index)\n"
+                    "  prob [N]                     — probabilistic inference (sampling monad)\n"
                     "  secd [n]                     — SECD abstract machine evaluation\n"
                     "  unify [rule …]               — first-order unification (MGU) of rule terms\n"
                     "  skiplist                     — skip list label index + range queries\n"
@@ -8788,6 +9769,77 @@ def run_repl() -> None:
                         print(f"  … ({len(result_map) - 20} more)")
                 else:
                     print("  (no results — try increasing max_ticks or reducing range)")
+
+            case "nbe":
+                n_demo = int(parts[1]) if len(parts) > 1 else 9
+                nf1, nf2 = nbe_fizzbuzz_demo(n_demo)
+                print(f"  NbE normalization demos (n={n_demo}):")
+                print(f"    compose identity (+1) {n_demo}  →  {nbe_pretty(nf1)}")
+                print(f"    (λb. if b then 'yes' else 'no') ({n_demo} mod 3 == 0)  →  {nbe_pretty(nf2)}")
+                # Also normalize a lambda under an open context
+                rule = RuleRegistry().get(state["rule"])
+                e = ELam("n", EBinOp("eq", EBinOp("mod", EVar("n"), EConst(3)), EConst(0)))
+                nf = nbe_normalize(e, STFun(STInt(), STBool()))
+                print(f"    NbE η-expand λn.(n mod 3 == 0) : Int→Bool  →  {nbe_pretty(nf)}")
+
+            case "typecheck":
+                suite = _bidir_fizzbuzz_suite()
+                results_tc = bidir_typecheck_program(suite)
+                print("  Bidirectional type checking suite:")
+                for name, res in results_tc:
+                    print(f"    {name:<45}  {res}")
+
+            case "treap":
+                rule = RuleRegistry().get(state["rule"])
+                lo, hi = state["start"], state["stop"]
+                t = build_fizzbuzz_treap(rule, lo, hi)
+                sz = treap_size(t)
+                ht = treap_height(t)
+                print(f"  Treap: size={sz}, height={ht} (expected O(log n)≈{sz.bit_length()})")
+                # Range query
+                mid = (lo + hi) // 2
+                rq = treap_range_query(t, lo, mid)
+                print(f"  Range [{lo},{mid}]: {len(rq)} items")
+                for k, v in rq[:8]:
+                    print(f"    {k:>4}  {v}")
+                if len(rq) > 8: print(f"    … ({len(rq)-8} more)")
+                # Delete and re-search
+                t2 = treap_delete(t, mid)
+                found_after = treap_search(t2, mid)
+                print(f"  After delete({mid}): search → {found_after}")
+                # Inverted label treap
+                idx_t = treap_label_index(rule, lo, min(hi, lo + 29))
+                lbl_list = treap_to_sorted_list(idx_t)
+                print(f"\n  Label-keyed treap ({len(lbl_list)} distinct labels):")
+                for lbl_k, ns in lbl_list[:5]:
+                    print(f"    {lbl_k!r:<14} n={ns[:5]}{'…' if len(ns)>5 else ''}")
+
+            case "rope":
+                rule = RuleRegistry().get(state["rule"])
+                lo, hi = state["start"], state["stop"]
+                r = fizzbuzz_rope(rule, lo, hi)
+                stats = rope_stats(r)
+                print(f"  Rope stats: {stats}")
+                # Slice first 40 chars
+                snip = rope_to_str(rope_slice(r, 0, min(40, stats["total_length"])))
+                print(f"  First 40 chars: {snip!r}")
+                # Split at midpoint
+                mid_c = stats["total_length"] // 2
+                r1, r2 = rope_split(r, mid_c)
+                print(f"  Split at {mid_c}: left={rope_length(r1)}, right={rope_length(r2)}")
+                rejoined = rope_concat(r1, r2)
+                print(f"  Concat round-trip ok: {rope_to_str(rejoined) == rope_to_str(r)}")
+                # Rebalance
+                rb = rope_rebalance(r)
+                print(f"  Depth before rebalance: {stats['depth']}, after: {rope_depth(rb)}")
+
+            case "prob":
+                rule = RuleRegistry().get(state["rule"])
+                lo, hi = state["start"], state["stop"]
+                n_s = int(parts[1]) if len(parts) > 1 else 3000
+                lines_prob = prob_run_fizzbuzz_queries(rule, lo, hi, n_samples=n_s)
+                for ln in lines_prob:
+                    print(ln)
 
             case "secd":
                 rule = RuleRegistry().get(state["rule"])
@@ -9164,6 +10216,43 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
     gr_p.add_argument("--stop",    type=int, default=30)
     gr_p.add_argument("--rule",    default="classic")
     gr_p.add_argument("--workers", type=int, default=4)
+
+    # ── nbe ───────────────────────────────────────────────────────────────────
+    nbe_p = sub.add_parser("nbe", help="Normalization by Evaluation (NbE)")
+    nbe_p.add_argument("--n", type=int, default=9, metavar="N",
+                       help="Value for the compose/classify demo")
+    nbe_p.add_argument("--rule", default="classic")
+
+    # ── typecheck ─────────────────────────────────────────────────────────────
+    tc_p = sub.add_parser("typecheck", help="Bidirectional type checker for mini-lambda")
+    tc_p.add_argument("expr", nargs="*",
+                      help="Python expr for a SECD expression (optional; default: suite)")
+    tc_p.add_argument("--type", default=None, metavar="TY",
+                      help="Expected type (e.g. STInt(), STFun(STInt(),STStr()))")
+
+    # ── treap ─────────────────────────────────────────────────────────────────
+    treap_p = sub.add_parser("treap", help="Treap (randomised BST) demo")
+    treap_p.add_argument("--start",  type=int, default=1)
+    treap_p.add_argument("--stop",   type=int, default=50)
+    treap_p.add_argument("--rule",   default="classic")
+    treap_p.add_argument("--seed",   type=int, default=None,
+                         help="Random seed for reproducible priorities")
+
+    # ── rope ──────────────────────────────────────────────────────────────────
+    rope_p = sub.add_parser("rope", help="Rope string tree (split / concat / index)")
+    rope_p.add_argument("--start",  type=int, default=1)
+    rope_p.add_argument("--stop",   type=int, default=100)
+    rope_p.add_argument("--rule",   default="classic")
+    rope_p.add_argument("--slice",  type=str, default=None, metavar="LO:HI",
+                        help="Slice the output rope (character positions)")
+
+    # ── prob ──────────────────────────────────────────────────────────────────
+    prob_p = sub.add_parser("prob", help="Probabilistic inference via sampling monad")
+    prob_p.add_argument("--start",   type=int, default=1)
+    prob_p.add_argument("--stop",    type=int, default=1000)
+    prob_p.add_argument("--rule",    default="classic")
+    prob_p.add_argument("--samples", type=int, default=5000, metavar="N")
+    prob_p.add_argument("--seed",    type=int, default=None)
 
     # ── secd ──────────────────────────────────────────────────────────────────
     secd_p = sub.add_parser("secd", help="SECD abstract machine evaluation")
@@ -9759,6 +10848,111 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
             for n_val in sorted(result_map.keys()):
                 print(f"  {n_val:>4}  {result_map[n_val]}")
             print(f"\n  {len(result_map)} results collected", file=sys.stderr)
+
+        case "nbe":
+            nf1, nf2 = nbe_fizzbuzz_demo(args.n)
+            print(f"Normalization by Evaluation  (n={args.n}):")
+            print(f"  compose identity (+1) {args.n}  →  {nbe_pretty(nf1)}")
+            print(f"  (λb. if b then 'yes' else 'no') ({args.n} mod 3 == 0)  →  {nbe_pretty(nf2)}")
+            # η-expansion demo
+            e_eta = ELam("n", EBinOp("add", EVar("n"), EConst(0)))
+            nf_eta = nbe_normalize(e_eta, STFun(STInt(), STInt()))
+            print(f"\n  η-long NF of  λn. n+0  :  {nbe_pretty(nf_eta)}")
+            e_compose = ELam("f", ELam("g", ELam("x",
+                EApp(EVar("f"), EApp(EVar("g"), EVar("x"))))))
+            nf_compose = nbe_normalize(e_compose,
+                STFun(STFun(STInt(), STInt()),
+                      STFun(STFun(STInt(), STInt()),
+                            STFun(STInt(), STInt()))))
+            print(f"  η-long NF of  compose  :  {nbe_pretty(nf_compose)}")
+
+        case "typecheck":
+            _tc_ns = {
+                "STInt": STInt, "STBool": STBool, "STStr": STStr, "STUnit": STUnit,
+                "STFun": STFun, "EConst": EConst, "EVar": EVar, "ELam": ELam,
+                "EApp": EApp, "EIf": EIf, "EBinOp": EBinOp, "ELet": ELet,
+                "EFizzBuzz": EFizzBuzz,
+            }
+            if args.expr:
+                expr_src = " ".join(args.expr)
+                try:
+                    expr_tc = eval(expr_src, _tc_ns)  # noqa: S307
+                    if args.type:
+                        ty_tc = eval(args.type, _tc_ns)  # noqa: S307
+                        r_tc = bidir_check_expr(expr_tc, ty_tc)
+                    else:
+                        r_tc = bidir_infer(expr_tc, {})
+                    print(f"Expression: {expr_src}")
+                    if r_tc.is_ok():
+                        print(f"  ✓  type = {r_tc.unwrap()!r}")
+                    else:
+                        print(f"  ✗  {r_tc.error}")
+                except Exception as exc:
+                    print(f"Error: {exc}")
+            else:
+                suite = _bidir_fizzbuzz_suite()
+                results_tc = bidir_typecheck_program(suite)
+                print("Bidirectional type-checking suite:")
+                for name, res in results_tc:
+                    print(f"  {name:<45}  {res}")
+
+        case "treap":
+            if args.seed is not None:
+                _random.seed(args.seed)
+            rule = RuleRegistry().get(args.rule)
+            t = build_fizzbuzz_treap(rule, args.start, args.stop)
+            sz = treap_size(t)
+            ht = treap_height(t)
+            print(f"Treap over [{args.start}..{args.stop}] rule={args.rule!r}:")
+            print(f"  size={sz}  height={ht}  (expected O(log n) ≈ {sz.bit_length()})")
+            items_t = treap_to_sorted_list(t)
+            print(f"  First 10 items: {items_t[:10]}")
+            mid_k = (args.start + args.stop) // 2
+            rq = treap_range_query(t, args.start, mid_k)
+            print(f"\n  Range [{args.start}..{mid_k}]: {len(rq)} items")
+            t_del = treap_delete(t, mid_k)
+            print(f"  After delete({mid_k}): size={treap_size(t_del)}  "
+                  f"search={treap_search(t_del, mid_k)}")
+            idx_t = treap_label_index(rule, args.start, args.stop)
+            print(f"\n  Label-indexed treap ({treap_size(idx_t)} labels):")
+            for lbl_k, ns in treap_to_sorted_list(idx_t):
+                print(f"    {str(lbl_k):<14} count={len(ns)}  n={ns[:5]}{'…' if len(ns)>5 else ''}")
+
+        case "rope":
+            rule = RuleRegistry().get(args.rule)
+            r = fizzbuzz_rope(rule, args.start, args.stop)
+            stats = rope_stats(r)
+            print(f"Rope [{args.start}..{args.stop}] rule={args.rule!r}:")
+            for k, v in stats.items():
+                print(f"  {k:<20} {v:.1f}" if isinstance(v, float) else f"  {k:<20} {v}")
+            if args.slice:
+                try:
+                    lo_s, hi_s = (int(x) for x in args.slice.split(":"))
+                    sliced = rope_slice(r, lo_s, hi_s)
+                    print(f"\n  rope[{lo_s}:{hi_s}] = {rope_to_str(sliced)!r}")
+                except Exception as exc:
+                    print(f"  Slice error: {exc}")
+            else:
+                preview = rope_to_str(rope_slice(r, 0, min(80, stats["total_length"])))
+                print(f"\n  First 80 chars:\n  {preview!r}")
+            # Split + concat round-trip
+            mid_c = stats["total_length"] // 2
+            r1, r2 = rope_split(r, mid_c)
+            rejoined = rope_concat(r1, r2)
+            print(f"\n  Split at {mid_c}: left={rope_length(r1)}, right={rope_length(r2)}")
+            print(f"  Concat round-trip ok: {rope_to_str(rejoined) == rope_to_str(r)}")
+            rb = rope_rebalance(r)
+            print(f"  Depth: {stats['depth']} → {rope_depth(rb)} after rebalance")
+
+        case "prob":
+            if args.seed is not None:
+                _random.seed(args.seed)
+            rule = RuleRegistry().get(args.rule)
+            print(f"Probabilistic FizzBuzz over [{args.start}..{args.stop}] "
+                  f"rule={args.rule!r} ({args.samples} samples):")
+            lines_prob = prob_run_fizzbuzz_queries(rule, args.start, args.stop, args.samples)
+            for ln in lines_prob:
+                print(ln)
 
         case "secd":
             rule = RuleRegistry().get(args.rule)
