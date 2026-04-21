@@ -1104,6 +1104,176 @@ class CPSInterpreter:
 
 
 # ===========================================================================
+# § 2g  Kleisli category  (monadic arrow composition)
+# ===========================================================================
+# A *Kleisli arrow* A →_M B is a function A → M[B].  Kleisli arrows form a
+# category: the identity is A → M[A] = pure, and composition is fish (>=>).
+#
+# We instantiate over the Result monad (§ 2) giving a category of
+# *fallible* computations.  Every Kleisli arrow is a typed transformation
+# that may succeed (Ok) or fail (Err).
+#
+# Operations:
+#   Kleisli.identity()      — λa. Ok(a)
+#   Kleisli.lift(f)         — wrap a total function
+#   Kleisli.guard(pred)     — pass-through if pred holds, else Err
+#   Kleisli.fail(msg)       — always-failing arrow
+#   k1 >> k2               — compose (>=>): feed Ok-result of k1 into k2
+#   k1.fanout(k2)          — (&&&): fork input into both arrows, pair results
+#   k1.split(k2)           — (***): apply k1 to fst, k2 to snd of a pair
+#   k1.local(f)            — pre-process input with total function f
+#   k1.map(f)              — post-process Ok-output with total function f
+#   k1.recover(f)          — convert Err back to Ok via f
+#
+# Domain pipeline:
+#   parse_int_k            — str → Result[int, str]
+#   validate_range_k       — int → Result[int, str]  (range-check)
+#   to_number_k            — int → Result[Number, str]
+#   eval_rule_k(rule)      — Number → Result[str, str]  (never actually fails)
+#   fizzbuzz_pipeline_k    — full str→str pipeline
+
+V2 = TypeVar("V2")
+
+
+@dataclasses.dataclass(frozen=True)
+class Kleisli(Generic[T, U]):
+    """Kleisli arrow over Result[·, str]: a function T → Result[U, str]."""
+    _run: Callable[[T], "Result[U, str]"]
+
+    def run(self, a: T) -> "Result[U, str]":
+        return self._run(a)
+
+    def __call__(self, a: T) -> "Result[U, str]":
+        return self._run(a)
+
+    # ── category operations ───────────────────────────────────────────────
+
+    @classmethod
+    def identity(cls) -> "Kleisli[T, T]":
+        return cls(lambda a: Ok(a))
+
+    @classmethod
+    def lift(cls, f: Callable[[T], U]) -> "Kleisli[T, U]":
+        """Lift a total function into a Kleisli arrow (never fails)."""
+        return cls(lambda a: Ok(f(a)))
+
+    @classmethod
+    def guard(cls, pred: Callable[[T], bool], msg: str = "guard failed") -> "Kleisli[T, T]":
+        """Pass input through if pred holds, else Err(msg)."""
+        return cls(lambda a: Ok(a) if pred(a) else Err(msg))
+
+    @classmethod
+    def fail(cls, msg: str) -> "Kleisli[T, Any]":
+        return cls(lambda _: Err(msg))
+
+    @classmethod
+    def from_result(cls, r: "Result[U, str]") -> "Kleisli[Any, U]":
+        """Constant Kleisli arrow that always returns r."""
+        return cls(lambda _: r)
+
+    # ── composition ───────────────────────────────────────────────────────
+
+    def __rshift__(self, other: "Kleisli[U, V2]") -> "Kleisli[T, V2]":
+        """Left-to-right Kleisli composition (>=>)."""
+        def _composed(a: T) -> "Result[V2, str]":
+            return self._run(a).flat_map(other._run)
+        return Kleisli(_composed)
+
+    def map(self, f: Callable[[U], V2]) -> "Kleisli[T, V2]":
+        return Kleisli(lambda a: self._run(a).map(f))
+
+    def recover(self, f: Callable[[str], U]) -> "Kleisli[T, U]":
+        """Convert an Err back to Ok via f (total recovery)."""
+        def _rec(a: T) -> "Result[U, str]":
+            r = self._run(a)
+            return r if r.is_ok() else Ok(f(r.error))
+        return Kleisli(_rec)
+
+    def local(self, f: Callable[[Any], T]) -> "Kleisli[Any, U]":
+        """Pre-process input with a total function."""
+        return Kleisli(lambda x: self._run(f(x)))
+
+    # ── arrow operations ──────────────────────────────────────────────────
+
+    def fanout(self, other: "Kleisli[T, V2]") -> "Kleisli[T, tuple[U, V2]]":
+        """(&&&) — fork: run both arrows on the same input, pair results."""
+        def _fan(a: T) -> "Result[tuple[U, V2], str]":
+            r1 = self._run(a)
+            if not r1.is_ok():
+                return r1
+            r2 = other._run(a)
+            if not r2.is_ok():
+                return r2
+            return Ok((r1.unwrap(), r2.unwrap()))
+        return Kleisli(_fan)
+
+    def split(self, other: "Kleisli[V2, Any]") -> "Kleisli[tuple[T, V2], tuple[U, Any]]":
+        """(***) — split: apply self to fst of pair, other to snd."""
+        def _split(pair: tuple[T, V2]) -> "Result[tuple[U, Any], str]":
+            a, b = pair
+            r1 = self._run(a)
+            if not r1.is_ok():
+                return r1
+            r2 = other._run(b)
+            if not r2.is_ok():
+                return r2
+            return Ok((r1.unwrap(), r2.unwrap()))
+        return Kleisli(_split)
+
+    def first(self) -> "Kleisli[tuple[T, Any], tuple[U, Any]]":
+        """Run self on fst, pass snd unchanged."""
+        return self.split(Kleisli.identity())
+
+    def second(self) -> "Kleisli[tuple[Any, T], tuple[Any, U]]":
+        """Run self on snd, pass fst unchanged."""
+        return Kleisli.identity().split(self)
+
+    def __repr__(self) -> str:
+        return f"Kleisli({self._run})"
+
+
+# ── Domain Kleisli arrows ─────────────────────────────────────────────────
+
+_parse_int_k: Kleisli[str, int] = Kleisli(
+    lambda s: Ok(int(s)) if s.lstrip("-").isdigit() else Err(f"not an integer: {s!r}")
+)
+
+_validate_positive_k: Kleisli[int, int] = Kleisli.guard(
+    lambda n: n > 0, "number must be positive"
+)
+
+_to_number_k: Kleisli[int, "Number"] = Kleisli.lift(lambda n: Number(n))
+
+
+def _eval_rule_k(rule: "VisitableRule") -> Kleisli["Number", str]:
+    return Kleisli.lift(lambda n: rule(n) if rule(n) is not None else str(n.value))
+
+
+def fizzbuzz_pipeline_k(rule: "VisitableRule") -> Kleisli[str, str]:
+    """
+    Full Kleisli pipeline: str → int → (validated) int → Number → label.
+    Composition of four arrows; any step can short-circuit with Err.
+    """
+    return _parse_int_k >> _validate_positive_k >> _to_number_k >> _eval_rule_k(rule)
+
+
+def kleisli_run_many(
+    k: Kleisli[str, str],
+    inputs: list[str],
+) -> tuple[list[str], list[str]]:
+    """Run a Kleisli arrow on many inputs; partition into (successes, errors)."""
+    successes: list[str] = []
+    errors: list[str] = []
+    for inp in inputs:
+        result = k(inp)
+        if result.is_ok():
+            successes.append(result.unwrap())
+        else:
+            errors.append(f"{inp!r} → {result.error}")
+    return successes, errors
+
+
+# ===========================================================================
 # § 3  Event bus
 # ===========================================================================
 
@@ -1772,6 +1942,227 @@ def abstract_prove_never_label(rule: "VisitableRule", iv: Interval, label: str) 
     """Return True if label cannot appear for any n ∈ iv."""
     result = abstract_eval(rule, iv)
     return label not in result.possible_labels
+
+
+# ===========================================================================
+# § 6d  Brzozowski derivatives  (regex-as-algebra with derivative matching)
+# ===========================================================================
+# A Brzozowski derivative of a language L w.r.t. character c is:
+#   ∂_c(L) = { w | cw ∈ L }
+# This extends to regular expressions structurally, yielding a complete,
+# purely algebraic matching algorithm without NFA/DFA construction:
+#
+#   nullable(r)  — does r accept the empty string ε?
+#   deriv(r, c)  — derivative of r w.r.t. character c
+#   simplify(r)  — algebraic simplification (keeps derivatives small)
+#   matches(r,s) — fold deriv over s, then check nullable
+#
+# RE algebra:
+#   RE_Empty     — ∅      (matches nothing)
+#   RE_Eps       — ε      (matches empty string only)
+#   RE_Char(c)   — 'c'    (matches single character c)
+#   RE_Any       — .      (matches any single character)
+#   RE_Concat    — rs     (concatenation)
+#   RE_Alt       — r|s    (alternation)
+#   RE_Star      — r*     (Kleene star)
+#   RE_Neg       — ¬r     (complement — matches what r doesn't)
+#   RE_Inter     — r&s    (intersection)
+#
+# Convenience builders: re_lit(s), re_opt(r), re_plus(r), re_repeat(r,n)
+# Domain application: FizzBuzz label classifier, output validator
+
+@dataclasses.dataclass(frozen=True)
+class RE_Empty:
+    def __repr__(self) -> str: return "∅"
+
+@dataclasses.dataclass(frozen=True)
+class RE_Eps:
+    def __repr__(self) -> str: return "ε"
+
+@dataclasses.dataclass(frozen=True)
+class RE_Char:
+    c: str
+    def __repr__(self) -> str: return repr(self.c)
+
+@dataclasses.dataclass(frozen=True)
+class RE_Any:
+    def __repr__(self) -> str: return "."
+
+@dataclasses.dataclass(frozen=True)
+class RE_Concat:
+    left: Any
+    right: Any
+    def __repr__(self) -> str: return f"({self.left!r}{self.right!r})"
+
+@dataclasses.dataclass(frozen=True)
+class RE_Alt:
+    left: Any
+    right: Any
+    def __repr__(self) -> str: return f"({self.left!r}|{self.right!r})"
+
+@dataclasses.dataclass(frozen=True)
+class RE_Star:
+    inner: Any
+    def __repr__(self) -> str: return f"({self.inner!r})*"
+
+@dataclasses.dataclass(frozen=True)
+class RE_Neg:
+    inner: Any
+    def __repr__(self) -> str: return f"¬({self.inner!r})"
+
+@dataclasses.dataclass(frozen=True)
+class RE_Inter:
+    left: Any
+    right: Any
+    def __repr__(self) -> str: return f"({self.left!r}&{self.right!r})"
+
+
+RE: TypeAlias = RE_Empty | RE_Eps | RE_Char | RE_Any | RE_Concat | RE_Alt | RE_Star | RE_Neg | RE_Inter
+
+
+def re_nullable(r: RE) -> bool:
+    """Return True iff r accepts the empty string ε."""
+    match r:
+        case RE_Empty():  return False
+        case RE_Eps():    return True
+        case RE_Char():   return False
+        case RE_Any():    return False
+        case RE_Concat(left=l, right=rr): return re_nullable(l) and re_nullable(rr)
+        case RE_Alt(left=l, right=rr):    return re_nullable(l) or re_nullable(rr)
+        case RE_Star():   return True
+        case RE_Neg(inner=i):             return not re_nullable(i)
+        case RE_Inter(left=l, right=rr):  return re_nullable(l) and re_nullable(rr)
+        case _:           return False
+
+
+def re_deriv(r: RE, c: str) -> RE:
+    """Compute the Brzozowski derivative ∂_c(r)."""
+    match r:
+        case RE_Empty():  return RE_Empty()
+        case RE_Eps():    return RE_Empty()
+        case RE_Char(c=ch): return RE_Eps() if c == ch else RE_Empty()
+        case RE_Any():    return RE_Eps()
+        case RE_Concat(left=l, right=rr):
+            dl_r = RE_Concat(re_deriv(l, c), rr)
+            if re_nullable(l):
+                return re_simplify(RE_Alt(dl_r, re_deriv(rr, c)))
+            return re_simplify(dl_r)
+        case RE_Alt(left=l, right=rr):
+            return re_simplify(RE_Alt(re_deriv(l, c), re_deriv(rr, c)))
+        case RE_Star(inner=i):
+            return re_simplify(RE_Concat(re_deriv(i, c), r))
+        case RE_Neg(inner=i):
+            return re_simplify(RE_Neg(re_deriv(i, c)))
+        case RE_Inter(left=l, right=rr):
+            return re_simplify(RE_Inter(re_deriv(l, c), re_deriv(rr, c)))
+        case _:
+            return RE_Empty()
+
+
+def re_simplify(r: RE) -> RE:
+    """Algebraic simplification to keep derivatives compact."""
+    match r:
+        # Concat identity / annihilation
+        case RE_Concat(left=RE_Empty(), right=_): return RE_Empty()
+        case RE_Concat(left=_, right=RE_Empty()): return RE_Empty()
+        case RE_Concat(left=RE_Eps(), right=rr):  return re_simplify(rr)
+        case RE_Concat(left=ll, right=RE_Eps()):  return re_simplify(ll)
+        # Alt identity / idempotence
+        case RE_Alt(left=RE_Empty(), right=rr):   return re_simplify(rr)
+        case RE_Alt(left=ll, right=RE_Empty()):   return re_simplify(ll)
+        case RE_Alt(left=ll, right=rr) if ll == rr: return re_simplify(ll)
+        # Inter annihilation / identity
+        case RE_Inter(left=RE_Empty(), right=_):  return RE_Empty()
+        case RE_Inter(left=_, right=RE_Empty()):  return RE_Empty()
+        case RE_Inter(left=ll, right=rr) if ll == rr: return re_simplify(ll)
+        # Double negation
+        case RE_Neg(inner=RE_Neg(inner=i)):       return re_simplify(i)
+        # Star idempotence
+        case RE_Star(inner=RE_Star(inner=i)):     return re_simplify(RE_Star(i))
+        case RE_Star(inner=RE_Eps()):             return RE_Eps()
+        case RE_Star(inner=RE_Empty()):           return RE_Eps()
+        case _:
+            return r
+
+
+def re_matches(r: RE, s: str) -> bool:
+    """Match string s against regex r using Brzozowski derivatives."""
+    cur = r
+    for c in s:
+        cur = re_simplify(re_deriv(cur, c))
+        if isinstance(cur, RE_Empty):
+            return False
+    return re_nullable(cur)
+
+
+# ── Convenience builders ──────────────────────────────────────────────────
+
+def re_lit(s: str) -> RE:
+    """Build a regex matching the literal string s."""
+    r: RE = RE_Eps()
+    for c in reversed(s):
+        r = RE_Concat(RE_Char(c), r)
+    return r
+
+
+def re_opt(r: RE) -> RE:
+    """r? — optional r."""
+    return RE_Alt(r, RE_Eps())
+
+
+def re_plus(r: RE) -> RE:
+    """r+ — one or more r."""
+    return RE_Concat(r, RE_Star(r))
+
+
+def re_repeat(r: RE, n: int) -> RE:
+    """r{n} — exactly n repetitions of r."""
+    if n <= 0:
+        return RE_Eps()
+    result: RE = r
+    for _ in range(n - 1):
+        result = RE_Concat(result, r)
+    return result
+
+
+def re_char_class(chars: str) -> RE:
+    """Build an alternation over all characters in chars."""
+    if not chars:
+        return RE_Empty()
+    r: RE = RE_Char(chars[0])
+    for c in chars[1:]:
+        r = RE_Alt(r, RE_Char(c))
+    return r
+
+
+_RE_DIGIT: RE = re_char_class("0123456789")
+_RE_DIGITS: RE = re_plus(_RE_DIGIT)
+
+# FizzBuzz-specific regexes
+_RE_FIZZ:     RE = re_lit(FIZZ)
+_RE_BUZZ:     RE = re_lit(BUZZ)
+_RE_FIZZBUZZ: RE = re_lit(FIZZBUZZ)
+_RE_NUMBER:   RE = re_opt(re_lit("-"))  # optional minus sign
+_RE_NUMBER    = RE_Concat(_RE_NUMBER, _RE_DIGITS)
+_RE_FB_OUTPUT: RE = RE_Alt(RE_Alt(_RE_FIZZBUZZ, RE_Alt(_RE_FIZZ, _RE_BUZZ)), _RE_NUMBER)
+
+# Validator using Brzozowski matching
+def validate_fizzbuzz_output(s: str) -> bool:
+    """Return True iff s is a valid FizzBuzz output token."""
+    return re_matches(_RE_FB_OUTPUT, s)
+
+
+def re_classify(s: str) -> str:
+    """Classify a FizzBuzz output string."""
+    for label, pattern in (
+        ("FizzBuzz", _RE_FIZZBUZZ),
+        ("Fizz",     _RE_FIZZ),
+        ("Buzz",     _RE_BUZZ),
+        ("number",   _RE_NUMBER),
+    ):
+        if re_matches(pattern, s):
+            return label
+    return "unknown"
 
 
 # ===========================================================================
@@ -2871,6 +3262,112 @@ class BloomFilter:
 
 
 # ===========================================================================
+# § 10c  HyperLogLog  (probabilistic distinct-cardinality estimator)
+# ===========================================================================
+# HyperLogLog estimates |S| (number of distinct elements in a multiset S) in
+# O(2^b) space and O(1) amortised time, with ~1.04/√(2^b) relative error.
+#
+# Algorithm (Flajolet et al., 2007):
+#   1. Hash each element to a b + 64-b bit string.
+#   2. Use the first b bits as a register index j ∈ [0, 2^b).
+#   3. In register M[j] store max(M[j], position_of_first_1_in_remaining_bits).
+#   4. Estimate cardinality as α_m · m² · (Σ 2^{-M[j]})^{-1} with bias corrections
+#      for small and large range.
+#
+# Extra: `merge(other)` — union of two HyperLogLog sketches in O(m) time.
+
+_HLL_ALPHA: dict[int, float] = {16: 0.673, 32: 0.697, 64: 0.709}
+
+
+class HyperLogLog:
+    """Space-efficient probabilistic distinct-element counter."""
+
+    def __init__(self, b: int = 8) -> None:
+        """
+        b — number of register bits; m = 2^b registers.
+        b=8 → 256 registers, ~1.6% relative error.
+        b=10 → 1024 registers, ~0.8% relative error.
+        """
+        if not 4 <= b <= 16:
+            raise ValueError("b must be in [4, 16]")
+        self._b = b
+        self._m = 1 << b         # number of registers
+        self._M = bytearray(self._m)  # register array (max rho values ≤ 64)
+        # α_m bias correction constant
+        if self._m in _HLL_ALPHA:
+            self._alpha = _HLL_ALPHA[self._m]
+        else:
+            self._alpha = 0.7213 / (1.0 + 1.079 / self._m)
+
+    def add(self, item: Any) -> None:
+        """Add an item to the sketch."""
+        h = int(hashlib.md5(str(item).encode()).hexdigest(), 16)
+        # Use top b bits as register index
+        j = h >> (128 - self._b)
+        # Remaining bits: find position of first 1 (rho)
+        w = h & ((1 << (128 - self._b)) - 1)
+        # rho = position of the leftmost 1-bit in w (1-indexed, max = 128-b)
+        max_bits = 128 - self._b
+        if w == 0:
+            rho = max_bits + 1
+        else:
+            rho = max_bits - w.bit_length() + 1
+        if rho > self._M[j]:
+            self._M[j] = rho
+
+    def estimate(self) -> float:
+        """Return the estimated number of distinct elements."""
+        m = self._m
+        Z = sum(2.0 ** (-float(r)) for r in self._M)
+        E = self._alpha * m * m / Z
+
+        # Small range correction
+        if E <= 2.5 * m:
+            V = self._M.count(0)   # number of zero registers
+            if V > 0:
+                E = m * math.log(m / V)
+
+        # Large range correction (2^32 boundary — adapt for 128-bit hashes)
+        # Not needed for typical FizzBuzz cardinalities; skip here.
+        return E
+
+    def merge(self, other: "HyperLogLog") -> "HyperLogLog":
+        """Return a new sketch representing the union of self and other."""
+        if self._b != other._b:
+            raise ValueError("Cannot merge HyperLogLog sketches with different b")
+        merged = HyperLogLog(self._b)
+        for i in range(self._m):
+            merged._M[i] = max(self._M[i], other._M[i])
+        return merged
+
+    def __len__(self) -> int:
+        return round(self.estimate())
+
+    def relative_error(self) -> float:
+        """Theoretical relative standard error."""
+        return 1.04 / math.sqrt(self._m)
+
+    def __repr__(self) -> str:
+        return (f"HyperLogLog(b={self._b}, m={self._m}, "
+                f"estimate≈{self.estimate():.0f}, "
+                f"err≈{self.relative_error():.1%})")
+
+
+def hll_fizzbuzz(
+    rule: "VisitableRule",
+    start: int = 1,
+    stop: int = 10_000,
+    b: int = 8,
+) -> HyperLogLog:
+    """Build a HyperLogLog sketch of distinct FizzBuzz outputs over [start, stop]."""
+    hll = HyperLogLog(b)
+    for n in range(start, stop + 1):
+        label = rule(Number(n)) or str(n)
+        hll.add(label)
+    return hll
+
+
+# ===========================================================================
 # § 11  Circuit breaker
 # ===========================================================================
 
@@ -3937,6 +4434,166 @@ def stream_running_counts(
         new[label] += 1
         return new
     return labels.scan(_update, Counter())
+
+
+# ===========================================================================
+# § 13g  Persistent segment tree  (immutable, versioned range structure)
+# ===========================================================================
+# A *persistent* (functional) segment tree allows O(log n) point updates that
+# produce a *new root* sharing all unmodified nodes with the old version.
+# This gives us an O(1) "undo" / version history for free.
+#
+# Each SegNode stores an aggregate `val` (here: sum of label-code counts).
+# Nodes are immutable; an update creates O(log n) new nodes on the path from
+# root to leaf, leaving the rest shared.
+#
+# Operations:
+#   seg_build(values)          — O(n) initial construction from a list
+#   seg_update(node, lo, hi, i, delta) — point-update; returns new root
+#   seg_query(node, lo, hi, l, r)      — range-sum query [l, r]
+#   seg_range_max(node, lo, hi, l, r)  — range-max query [l, r]
+#
+# FizzBuzz application:
+#   We map each integer n ∈ [start, stop] to an index.
+#   The value stored is a numeric *label code* (0=number, 1=Fizz, 2=Buzz,
+#   3=FizzBuzz).  After each n we save the new root, giving a full versioned
+#   history of the cumulative label-code sum over any prefix.
+
+@dataclasses.dataclass(frozen=True)
+class SegNode:
+    """Immutable segment tree node storing sum and max aggregates."""
+    total: int
+    maximum: int
+    left: "SegNode | None" = None
+    right: "SegNode | None" = None
+
+    @classmethod
+    def leaf(cls, val: int) -> "SegNode":
+        return cls(total=val, maximum=val)
+
+    @classmethod
+    def combine(cls, l: "SegNode", r: "SegNode") -> "SegNode":
+        return cls(
+            total=l.total + r.total,
+            maximum=max(l.maximum, r.maximum),
+            left=l,
+            right=r,
+        )
+
+
+_SEG_NULL: SegNode = SegNode(0, 0)
+
+
+def seg_build(values: list[int]) -> SegNode:
+    """Build a segment tree from a list of integer values in O(n)."""
+    n = len(values)
+    if n == 0:
+        return _SEG_NULL
+    if n == 1:
+        return SegNode.leaf(values[0])
+    mid = n // 2
+    return SegNode.combine(seg_build(values[:mid]), seg_build(values[mid:]))
+
+
+def seg_update(node: SegNode, lo: int, hi: int, idx: int, delta: int) -> SegNode:
+    """
+    Point-update: add `delta` to position `idx` in [lo, hi].
+    Returns a new root sharing structure with `node`.
+    """
+    if lo == hi:
+        return SegNode.leaf(node.total + delta)
+    mid = (lo + hi) // 2
+    left = node.left or _SEG_NULL
+    right = node.right or _SEG_NULL
+    if idx <= mid:
+        new_left = seg_update(left, lo, mid, idx, delta)
+        return SegNode.combine(new_left, right)
+    else:
+        new_right = seg_update(right, mid + 1, hi, idx, delta)
+        return SegNode.combine(left, new_right)
+
+
+def seg_query_sum(node: SegNode, lo: int, hi: int, l: int, r: int) -> int:
+    """Range-sum query [l, r] in O(log n)."""
+    if node is _SEG_NULL or l > hi or r < lo:
+        return 0
+    if l <= lo and hi <= r:
+        return node.total
+    mid = (lo + hi) // 2
+    left = node.left or _SEG_NULL
+    right = node.right or _SEG_NULL
+    return seg_query_sum(left, lo, mid, l, r) + seg_query_sum(right, mid + 1, hi, l, r)
+
+
+def seg_query_max(node: SegNode, lo: int, hi: int, l: int, r: int) -> int:
+    """Range-max query [l, r] in O(log n)."""
+    if node is _SEG_NULL or l > hi or r < lo:
+        return 0
+    if l <= lo and hi <= r:
+        return node.maximum
+    mid = (lo + hi) // 2
+    left = node.left or _SEG_NULL
+    right = node.right or _SEG_NULL
+    return max(
+        seg_query_max(left, lo, mid, l, r),
+        seg_query_max(right, mid + 1, hi, l, r),
+    )
+
+
+_LABEL_CODE: dict[str | None, int] = {
+    None: 0,
+    FIZZ: 1,
+    BUZZ: 2,
+    FIZZBUZZ: 3,
+}
+
+
+@dataclasses.dataclass
+class PersistentLabelHistory:
+    """
+    Versioned label history for a FizzBuzz range.
+    Each 'commit' appends the label code for the next number and saves
+    a new segment tree root — the previous versions remain accessible.
+    """
+    _start: int
+    _stop: int
+    _roots: list[SegNode]          # roots[0] = empty; roots[i] = after i numbers
+    _size: int                     # = stop - start + 1
+
+    @classmethod
+    def build(cls, rule: "VisitableRule", start: int, stop: int) -> "PersistentLabelHistory":
+        size = stop - start + 1
+        # initial empty tree
+        empty_root = seg_build([0] * size)
+        roots: list[SegNode] = [empty_root]
+        cur = empty_root
+        for n_val in range(start, stop + 1):
+            label = rule(Number(n_val))
+            code = _LABEL_CODE.get(label, 0)
+            idx = n_val - start
+            cur = seg_update(cur, 0, size - 1, idx, code)
+            roots.append(cur)
+        return cls(_start=start, _stop=stop, _roots=roots, _size=size)
+
+    def query_sum(self, l: int, r: int, version: int = -1) -> int:
+        """Sum of label codes over [l, r] in the given version (-1 = latest)."""
+        root = self._roots[version]
+        li = max(0, l - self._start)
+        ri = min(self._size - 1, r - self._start)
+        return seg_query_sum(root, 0, self._size - 1, li, ri)
+
+    def query_max(self, l: int, r: int, version: int = -1) -> int:
+        """Max label code over [l, r] in the given version (-1 = latest)."""
+        root = self._roots[version]
+        li = max(0, l - self._start)
+        ri = min(self._size - 1, r - self._start)
+        return seg_query_max(root, 0, self._size - 1, li, ri)
+
+    def n_versions(self) -> int:
+        return len(self._roots)
+
+    def range(self) -> tuple[int, int]:
+        return self._start, self._stop
 
 
 # ===========================================================================
@@ -5144,6 +5801,147 @@ def run_ltl_properties(
 
 
 # ===========================================================================
+# § 19f  Non-determinism via delimited continuations  (list-monad CPS)
+# ===========================================================================
+# Delimited continuations generalise exceptions: instead of escaping to a
+# handler, `shift` reifies the continuation *up to* the nearest `reset`
+# prompt as a first-class function.  Calling that function multiple times
+# implements backtracking / non-determinism.
+#
+# We use the standard encoding over the list monad:
+#
+#   type NDCont[A, R] = (A → [R]) → [R]
+#
+#   reset_nd(m)     — run computation m, collect all results into a list
+#   shift_nd(f)     — capture current list-continuation as k; return f(k)
+#   amb(choices)    — non-deterministic choice: yield each element
+#   fail_nd()       — dead branch: contribute no results
+#   guard_nd(pred)  — prune branch unless pred holds
+#
+# Applications:
+#   nd_fizzbuzz_search(rule, start, stop, pred)
+#       — find all n in [start,stop] where pred(label) holds, via backtracking
+#   nd_rule_product(rules, n)
+#       — all (rule_name, label) pairs for a given n, non-deterministically
+#   nd_window_search(rule, start, stop, window, pattern)
+#       — find all windows of length `window` whose label sequence == pattern
+
+NDCont: TypeAlias = Callable[[Callable[[Any], list]], list]
+
+
+def reset_nd(m: NDCont) -> list:
+    """Run a non-deterministic computation; return all possible results."""
+    return m(lambda x: [x])
+
+
+def shift_nd(f: Callable[[Callable[[Any], list]], NDCont]) -> NDCont:
+    """Capture the current list-continuation and pass it to f."""
+    return lambda k: f(k)(k)
+
+
+def nd_pure(a: Any) -> NDCont:
+    """Return a single value non-deterministically (unit/return)."""
+    return lambda k: k(a)
+
+
+def nd_bind(m: NDCont, f: Callable[[Any], NDCont]) -> NDCont:
+    """Monadic bind for the non-deterministic continuation monad."""
+    def _bound(k: Callable[[Any], list]) -> list:
+        return m(lambda a: f(a)(k))
+    return _bound
+
+
+def amb(choices: list[Any]) -> NDCont:
+    """Non-deterministically choose from `choices`."""
+    return lambda k: [result for c in choices for result in k(c)]
+
+
+def fail_nd() -> NDCont:
+    """Dead branch — contributes no results."""
+    return lambda _k: []
+
+
+def guard_nd(pred: bool) -> NDCont:
+    """Prune the current branch if pred is False."""
+    return nd_pure(None) if pred else fail_nd()
+
+
+def nd_fizzbuzz_search(
+    rule: "VisitableRule",
+    start: int = 1,
+    stop: int = 100,
+    label_pred: Callable[[LabelT], bool] = lambda lbl: lbl is not None,
+) -> list[tuple[int, LabelT]]:
+    """
+    Non-deterministic search: find all (n, label) in [start,stop] where
+    label_pred(label) is True.  Uses delimited continuations for backtracking.
+    """
+    numbers = list(range(start, stop + 1))
+
+    def _prog(k: Callable[[Any], list]) -> list:
+        return amb(numbers)(lambda n:
+            nd_bind(
+                nd_pure(rule(Number(n))),
+                lambda lbl: nd_bind(
+                    guard_nd(label_pred(lbl)),
+                    lambda _: nd_pure((n, lbl)),
+                ),
+            )(k)
+        )
+
+    return reset_nd(_prog)
+
+
+def nd_rule_product(
+    rules: dict[str, "VisitableRule"],
+    n: int,
+) -> list[tuple[str, LabelT]]:
+    """
+    Non-deterministically enumerate (rule_name, label) for a fixed n.
+    Returns all pairs across all registered rules.
+    """
+    def _prog(k: Callable[[Any], list]) -> list:
+        return amb(list(rules.items()))(lambda pair:
+            nd_pure((pair[0], pair[1](Number(n))))(k)
+        )
+    return reset_nd(_prog)
+
+
+def nd_window_search(
+    rule: "VisitableRule",
+    start: int = 1,
+    stop: int = 100,
+    window: int = 3,
+    pattern: list[LabelT] | None = None,
+) -> list[tuple[int, list[LabelT]]]:
+    """
+    Find all starting positions where `window` consecutive outputs match
+    `pattern` (or any all-labelled window if pattern is None).
+    Returns list of (start_n, [labels]).
+    """
+    trace = [rule(Number(n)) for n in range(start, stop + 1)]
+    starts = list(range(len(trace) - window + 1))
+
+    def _matches_pattern(labels: list[LabelT]) -> bool:
+        if pattern is None:
+            return all(lbl is not None for lbl in labels)
+        return labels == pattern
+
+    def _prog(k: Callable[[Any], list]) -> list:
+        return amb(starts)(lambda i:
+            nd_bind(
+                nd_pure(trace[i:i + window]),
+                lambda labels: nd_bind(
+                    guard_nd(_matches_pattern(labels)),
+                    lambda _: nd_pure((start + i, labels)),
+                ),
+            )(k)
+        )
+
+    return reset_nd(_prog)
+
+
+# ===========================================================================
 # § 20  Interactive REPL
 # ===========================================================================
 
@@ -5545,6 +6343,77 @@ def run_repl() -> None:
                     case _:
                         print("Usage: effects [pure|count|io]")
 
+            case "kleisli":
+                rule = RuleRegistry().get(state["rule"])
+                pipeline = fizzbuzz_pipeline_k(rule)
+                inputs = [str(i) for i in range(state["start"], state["stop"] + 1)]
+                ok_vals, err_vals = kleisli_run_many(pipeline, inputs)
+                for v in ok_vals[:20]:
+                    print(f"  {v}")
+                if len(ok_vals) > 20:
+                    print(f"  … ({len(ok_vals) - 20} more)")
+                if err_vals:
+                    print(f"  Errors: {err_vals}")
+                # Demonstrate fanout and guard
+                label_k = _eval_rule_k(rule)
+                length_k = Kleisli.lift(lambda s: len(s))
+                paired = (Kleisli.lift(lambda n: Number(n)).local(int)
+                          >> label_k.fanout(Kleisli.lift(lambda n: n.value % 2 == 0)))
+                sample = _parse_int_k >> _validate_positive_k >> _to_number_k
+                sample_result = sample.fanout(Kleisli.lift(lambda s: s))(str(state["start"]))
+                print(f"\n  fanout demo (Number, is_even) for {state['start']}: {sample_result}")
+
+            case "regex":
+                token = parts[1] if len(parts) > 1 else "Fizz"
+                valid = validate_fizzbuzz_output(token)
+                cls_name = re_classify(token)
+                print(f"  {token!r}: valid={valid}, class={cls_name!r}")
+                # Show derivatives step by step
+                r = _RE_FB_OUTPUT
+                for i, c in enumerate(token):
+                    r = re_simplify(re_deriv(r, c))
+                    print(f"  after {token[:i+1]!r}: nullable={re_nullable(r)}")
+                print(f"  → matches: {re_nullable(r)}")
+
+            case "hll":
+                rule = RuleRegistry().get(state["rule"])
+                hll = hll_fizzbuzz(rule, state["start"], state["stop"])
+                exact = len({rule(Number(n)) or str(n)
+                             for n in range(state["start"], state["stop"] + 1)})
+                print(f"  {hll!r}")
+                print(f"  Exact distinct count: {exact}")
+                print(f"  Error: {abs(hll.estimate() - exact) / max(exact, 1):.1%}"
+                      f"  (theoretical ≤ {hll.relative_error():.1%})")
+
+            case "segtree":
+                rule = RuleRegistry().get(state["rule"])
+                lo, hi = state["start"], state["stop"]
+                hist = PersistentLabelHistory.build(rule, lo, hi)
+                mid = (lo + hi) // 2
+                print(f"  Persistent seg tree: {hist.n_versions()} versions for [{lo}, {hi}]")
+                print(f"  Sum of label-codes [lo..mid] (latest): {hist.query_sum(lo, mid)}")
+                print(f"  Max label-code  [lo..hi]  (latest):   {hist.query_max(lo, hi)}")
+                # Time-travel: query the state after the first 5 numbers
+                if hist.n_versions() > 5:
+                    print(f"  Sum [lo..hi] after 5 insertions (v5): {hist.query_sum(lo, hi, version=5)}")
+                code_names = {0: "number", 1: "Fizz", 2: "Buzz", 3: "FizzBuzz"}
+                print(f"  Max code = {code_names.get(hist.query_max(lo, hi), '?')!r}")
+
+            case "ndcont":
+                rule = RuleRegistry().get(state["rule"])
+                lo, hi = state["start"], state["stop"]
+                labelled = nd_fizzbuzz_search(rule, lo, hi, lambda lbl: lbl is not None)
+                print(f"  Labelled numbers in [{lo}, {hi}] via backtracking:")
+                for n_val, lbl in labelled[:20]:
+                    print(f"    {n_val:>4}  {lbl}")
+                if len(labelled) > 20:
+                    print(f"    … ({len(labelled) - 20} more)")
+                # Window search for runs of labelled outputs
+                windows = nd_window_search(rule, lo, min(hi, lo + 49), window=2)
+                print(f"\n  Consecutive-labelled windows (window=2, first 50 numbers):")
+                for start_n, lbls in windows[:5]:
+                    print(f"    n={start_n}: {lbls}")
+
             case "help":
                 print(
                     "  run / go                     — execute with current settings\n"
@@ -5578,6 +6447,11 @@ def run_repl() -> None:
                     "  iso                          — profunctor Iso/Adapter demo\n"
                     "  stream [N]                   — lazy infinite stream (take N)\n"
                     "  ltl                          — LTL temporal logic model checker\n"
+                    "  kleisli                      — Kleisli arrow pipeline\n"
+                    "  regex <token>                — Brzozowski derivative matching\n"
+                    "  hll                          — HyperLogLog cardinality sketch\n"
+                    "  segtree                      — persistent segment tree\n"
+                    "  ndcont                       — non-determinism via delimited continuations\n"
                     "  quit / exit                  — exit REPL\n"
                 )
             case _:
@@ -5773,6 +6647,46 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
     ltl_p.add_argument("--start", type=int, default=1)
     ltl_p.add_argument("--stop",  type=int, default=100)
     ltl_p.add_argument("--rule",  default="classic")
+
+    # ── kleisli ───────────────────────────────────────────────────────────────
+    kl_p = sub.add_parser("kleisli", help="Kleisli arrow pipeline over Result monad")
+    kl_p.add_argument("--start",  type=int, default=1)
+    kl_p.add_argument("--stop",   type=int, default=30)
+    kl_p.add_argument("--rule",   default="classic")
+    kl_p.add_argument("--bad",    nargs="*", default=[], metavar="TOKEN",
+                      help="Extra inputs to inject (may fail Kleisli guards)")
+
+    # ── regex ─────────────────────────────────────────────────────────────────
+    rx_p = sub.add_parser("regex", help="Brzozowski derivative regex matching")
+    rx_p.add_argument("--start",  type=int, default=1)
+    rx_p.add_argument("--stop",   type=int, default=20)
+    rx_p.add_argument("--rule",   default="classic")
+    rx_p.add_argument("--token",  default=None, help="Single token to classify")
+
+    # ── hll ───────────────────────────────────────────────────────────────────
+    hll_p = sub.add_parser("hll", help="HyperLogLog distinct-label cardinality sketch")
+    hll_p.add_argument("--start", type=int, default=1)
+    hll_p.add_argument("--stop",  type=int, default=10_000)
+    hll_p.add_argument("--rule",  default="classic")
+    hll_p.add_argument("--b",     type=int, default=8, metavar="BITS",
+                       help="Register bits (4–16); more → less error")
+
+    # ── segtree ───────────────────────────────────────────────────────────────
+    sg_p = sub.add_parser("segtree", help="Persistent segment tree over FizzBuzz label codes")
+    sg_p.add_argument("--start",   type=int, default=1)
+    sg_p.add_argument("--stop",    type=int, default=30)
+    sg_p.add_argument("--rule",    default="classic")
+    sg_p.add_argument("--query",   choices=["sum", "max"], default="sum")
+    sg_p.add_argument("--version", type=int, default=-1,
+                      help="Which version to query (-1 = latest)")
+
+    # ── ndcont ────────────────────────────────────────────────────────────────
+    nd_p = sub.add_parser("ndcont", help="Non-determinism via delimited continuations")
+    nd_p.add_argument("--start",  type=int, default=1)
+    nd_p.add_argument("--stop",   type=int, default=100)
+    nd_p.add_argument("--rule",   default="classic")
+    nd_p.add_argument("--mode",   choices=["labelled", "product", "windows"], default="labelled")
+    nd_p.add_argument("--window", type=int, default=3)
 
     args = parser.parse_args(argv)
     cmd = args.cmd or "run"
@@ -6083,6 +6997,125 @@ def main(argv: Sequence[str] = sys.argv[1:]) -> int:
                 if not holds:
                     all_hold = False
             print(f"\n{'All LTL properties hold.' if all_hold else 'SOME PROPERTIES FAILED.'}")
+
+        case "kleisli":
+            rule = RuleRegistry().get(args.rule)
+            pipeline = fizzbuzz_pipeline_k(rule)
+            good = [str(i) for i in range(args.start, args.stop + 1)]
+            bad_inputs: list[str] = list(args.bad) if args.bad else ["0", "-5", "abc", "999"]
+            all_inputs = good + bad_inputs
+            oks, errs = kleisli_run_many(pipeline, all_inputs)
+            print(f"Kleisli pipeline over {args.rule!r} [{args.start}..{args.stop}]:\n")
+            for v in oks:
+                print(v)
+            if errs:
+                print(f"\nFailed inputs:", file=sys.stderr)
+                for e in errs:
+                    print(f"  ✗ {e}", file=sys.stderr)
+
+            # Demonstrate arrow combinators
+            label_k = _eval_rule_k(rule)
+            parity_k = Kleisli.lift(lambda n: "even" if n.value % 2 == 0 else "odd")
+            both_k = _to_number_k >> label_k.fanout(parity_k)
+            print("\nfanout demo (label, parity):", file=sys.stderr)
+            for n_val in range(args.start, min(args.start + 5, args.stop + 1)):
+                res = (_validate_positive_k >> both_k)(n_val)
+                print(f"  {n_val}: {res.unwrap() if res.is_ok() else res.error}", file=sys.stderr)
+
+        case "regex":
+            rule = RuleRegistry().get(args.rule)
+            if args.token:
+                tokens = [args.token]
+            else:
+                tokens = [rule(Number(n)) or str(n)
+                          for n in range(args.start, args.stop + 1)]
+            print(f"{'Token':<16}  {'Valid':<6}  Class")
+            print("─" * 40)
+            for tok in tokens:
+                valid = validate_fizzbuzz_output(tok)
+                cls_name = re_classify(tok)
+                sym = "✓" if valid else "✗"
+                print(f"{tok:<16}  {sym:<6}  {cls_name}")
+            # also validate some intentional bad tokens
+            if not args.token:
+                print("\nInvalid token tests:")
+                for bad in ("", "fizz", "BUZZ", "1.5", "1 2"):
+                    v = validate_fizzbuzz_output(bad)
+                    print(f"  {bad!r:<14}  {'✓' if v else '✗'}  {re_classify(bad)}")
+
+        case "hll":
+            rule = RuleRegistry().get(args.rule)
+            hll = hll_fizzbuzz(rule, args.start, args.stop, b=args.b)
+            exact = len({rule(Number(n)) or str(n)
+                         for n in range(args.start, args.stop + 1)})
+            print(f"HyperLogLog sketch over {args.rule!r} [{args.start}..{args.stop}]:")
+            print(f"  Registers:         {hll._m}")
+            print(f"  Estimate:          {hll.estimate():.1f}")
+            print(f"  Exact:             {exact}")
+            err = abs(hll.estimate() - exact) / max(exact, 1)
+            print(f"  Observed error:    {err:.2%}")
+            print(f"  Theoretical bound: {hll.relative_error():.2%}")
+            # Demonstrate merging two sketches
+            hll_a = hll_fizzbuzz(rule, args.start, (args.start + args.stop) // 2, b=args.b)
+            hll_b = hll_fizzbuzz(rule, (args.start + args.stop) // 2 + 1, args.stop, b=args.b)
+            merged = hll_a.merge(hll_b)
+            print(f"\nMerged (a ∪ b) estimate: {merged.estimate():.1f}  (exact: {exact})")
+
+        case "segtree":
+            rule = RuleRegistry().get(args.rule)
+            hist = PersistentLabelHistory.build(rule, args.start, args.stop)
+            n_vers = hist.n_versions()
+            lo, hi = args.start, args.stop
+            print(f"Persistent segment tree: {args.rule!r} [{lo}..{hi}]")
+            print(f"  Versions: {n_vers}  (0=empty, {n_vers-1}=full)")
+            version = args.version if args.version != -1 else n_vers - 1
+            version = min(version, n_vers - 1)
+            if args.query == "sum":
+                total = hist.query_sum(lo, hi, version)
+                print(f"\n  Range-sum [{lo}..{hi}] at version {version}: {total}")
+                for q_start in range(lo, min(lo + 10, hi + 1)):
+                    s = hist.query_sum(lo, q_start, version)
+                    print(f"  Prefix sum [{lo}..{q_start}]: {s}")
+            else:
+                total = hist.query_max(lo, hi, version)
+                code_names = {0: "number", 1: "Fizz", 2: "Buzz", 3: "FizzBuzz"}
+                print(f"\n  Range-max [{lo}..{hi}] at version {version}: {total} ({code_names.get(total, '?')})")
+            # Time travel: show sum at each version step
+            print(f"\n  Cumulative sum over all versions (first 10):")
+            for v in range(min(10, n_vers)):
+                s = hist.query_sum(lo, hi, v)
+                print(f"    v{v:>3}: {s}")
+
+        case "ndcont":
+            rule = RuleRegistry().get(args.rule)
+            match args.mode:
+                case "labelled":
+                    results_nd = nd_fizzbuzz_search(
+                        rule, args.start, args.stop,
+                        lambda lbl: lbl is not None,
+                    )
+                    print(f"Labelled numbers in [{args.start}..{args.stop}] "
+                          f"(non-det backtracking):")
+                    for n_val, lbl in results_nd:
+                        print(f"  {n_val:>4}  {lbl}")
+                    print(f"\n  Total: {len(results_nd)} of {args.stop - args.start + 1}")
+
+                case "product":
+                    registry = RuleRegistry()
+                    rules_dict = {name: registry.get(name) for name in registry.names()}
+                    print(f"Rule × label product for n={args.start}:")
+                    for rule_name, lbl in nd_rule_product(rules_dict, args.start):
+                        print(f"  {rule_name:<22}  {lbl!r}")
+
+                case "windows":
+                    windows = nd_window_search(
+                        rule, args.start, args.stop, window=args.window
+                    )
+                    print(f"All-labelled windows of size {args.window} in "
+                          f"[{args.start}..{args.stop}]:")
+                    for start_n, lbls in windows:
+                        print(f"  n={start_n:>4}  {lbls}")
+                    print(f"\n  Total windows found: {len(windows)}")
 
         case "run":
             _mw_map: dict[str, Middleware] = {
